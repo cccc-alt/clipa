@@ -1,0 +1,292 @@
+import AppKit
+import Foundation
+
+var passed = 0
+var failed = 0
+var failures: [String] = []
+
+func check(_ name: String, _ condition: Bool, detail: String = "") {
+    if condition {
+        passed += 1
+    } else {
+        failed += 1
+        failures.append(name + (detail.isEmpty ? "" : " — \(detail)"))
+    }
+}
+
+let suiteName = "ClipaPrivacyFilterTest-\(UUID().uuidString)"
+guard let defaults = UserDefaults(suiteName: suiteName) else {
+    print("无法创建隔离 UserDefaults")
+    exit(1)
+}
+defaults.removePersistentDomain(forName: suiteName)
+let settings = SettingsStore(defaults: defaults)
+
+let storeDir = FileManager.default.temporaryDirectory
+    .appendingPathComponent("ClipaPrivacyFilterStore-\(UUID().uuidString)", isDirectory: true)
+let store = ClipStore(baseDirectory: storeDir)
+let monitor = ClipboardMonitor.shared
+
+func pasteboard(text: String, markers: [String] = []) -> NSPasteboard {
+    let pb = NSPasteboard(name: NSPasteboard.Name("ClipaFilterPB-\(UUID().uuidString)"))
+    pb.clearContents()
+    pb.setString(text, forType: .string)
+    for marker in markers {
+
+        pb.setData(
+            Data(marker.utf8),
+            forType: NSPasteboard.PasteboardType(marker)
+        )
+    }
+    return pb
+}
+
+func decide(
+    _ text: String,
+    from bundleID: String?,
+    pause: Bool = false,
+    ignorePM: Bool = true,
+    skipSensitive: Bool,
+    markers: [String] = [],
+    skipConfidential: Bool = true
+) -> ClipboardMonitor.CaptureDecision {
+    settings.pauseRecording = pause
+    settings.ignorePasswordManagers = ignorePM
+    settings.skipSensitive = skipSensitive
+    settings.skipConfidentialPasteboard = skipConfidential
+    return monitor.evaluate(
+        pasteboard: pasteboard(text: text, markers: markers),
+        frontBundleID: bundleID,
+        sourceName: "TestApp",
+        settings: settings,
+        store: store
+    )
+}
+
+for bundleID in SettingsStore.defaultPasswordManagerBundleIDs {
+    let decision = decide(
+        "s3cr3t-password-\(bundleID)",
+        from: bundleID,
+        skipSensitive: false
+    )
+    check(
+        "忽略密码管理器：\(bundleID)",
+        decision == .ignoredSource,
+        detail: String(describing: decision)
+    )
+}
+
+let onePassword = SettingsStore.defaultPasswordManagerBundleIDs[0]
+let offDecision = decide(
+    "s3cr3t-password-visible",
+    from: onePassword,
+    ignorePM: false,
+    skipSensitive: false
+)
+if case .captured(let item) = offDecision {
+    check(
+        "关闭忽略后密码管理器内容可记录",
+        item.text == "s3cr3t-password-visible"
+    )
+} else {
+    check("关闭忽略后密码管理器内容可记录", false, detail: String(describing: offDecision))
+}
+
+let terminalDecision = decide(
+    "kubectl get pods -A",
+    from: "com.apple.Terminal",
+    skipSensitive: false
+)
+if case .captured = terminalDecision {
+    check("普通应用不受密码管理器忽略影响", true)
+} else {
+    check("普通应用不受密码管理器忽略影响", false, detail: String(describing: terminalDecision))
+}
+
+let sensitiveSamples = [
+    "sk-" + "0123456789abcdef0123456789abcdef",
+    "AKIA" + "IOSFODNN7EXAMPLE",
+    "ghp_" + "abcdefghijklmnopqrstuvwxyz123456",
+    "xoxb-" + "123456789012-abcdefghijklmno",
+    "Authorization: Bearer " + "eyJhbGciOiJIUzI1NiJ9" + ".payload.signature",
+    "-----BEGIN " + "RSA PRIVATE KEY-----\n" + "MIIEowIBAAKCAQEA" + "\n-----END RSA PRIVATE KEY-----",
+    "password: hunter2hunter2",
+    "api_key=abcdefgh123456",
+    "密钥：abcdefgh1234567890",
+
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
+    "postgres://admin:S3cret@db.internal:5432/app",
+    "mongodb+srv://svc:Pa55w0rd@cluster0.example.net/db",
+    "redis://default:foobared@cache.internal:6379",
+    "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----",
+    #"{"password": "hunter2hunter2"}"#,
+
+    "password: $6$i3/J6tE.gh$ccHhabK2FsPT2U2OwMDiFZSPL7L18K",
+    "password: $y$j9T$21VgKI4Ug8Q/odUe/Tne31$6.0V1o7A4OJEjI8zXw9",
+    "password: $0$admin",
+    #"password: abc${REF}xyz123"#
+]
+
+let referenceSamples = [
+    "password: ${DB_PASSWORD}",
+    "password: ${DB_PASSWORD:-}",
+    "password: ${DB_PASSWORD:=fallback}",
+    "password: $DB_PASSWORD",
+    #"{"password": "@env:AC_PASSWORD"}"#,
+    #"{"password": "[parameters('windowsAdminPassword')]"}"#,
+    #"{"password": "${{ secrets.DB_PASSWORD }}"}"#
+]
+
+for (index, sample) in referenceSamples.enumerated() {
+    let decision = decide(
+        sample,
+        from: "com.apple.Safari",
+        skipSensitive: true
+    )
+    if case .captured = decision {
+        check("引用/模板值不算敏感 #\(index + 1)", true)
+    } else {
+        check(
+            "引用/模板值不算敏感 #\(index + 1)",
+            false,
+            detail: String(describing: decision)
+        )
+    }
+}
+
+for (index, sample) in sensitiveSamples.enumerated() {
+    let skipped = decide(
+        sample,
+        from: "com.apple.Safari",
+        skipSensitive: true
+    )
+    check(
+        "自动跳过敏感 #\(index + 1)",
+        skipped == .sensitiveSkipped,
+        detail: String(describing: skipped)
+    )
+}
+
+let allowSensitive = decide(
+    "sk-" + "0123456789abcdef0123456789abcdef",
+    from: "com.apple.Safari",
+    skipSensitive: false
+)
+if case .captured(let item) = allowSensitive {
+    check(
+        "关闭跳过敏感后仍可记录（带敏感标记）",
+        SensitiveDetector.containsSensitive(text: item.text)
+    )
+} else {
+    check("关闭跳过敏感后仍可记录（带敏感标记）", false, detail: String(describing: allowSensitive))
+}
+
+let normalDecision = decide(
+    "本周完成核心功能迭代，稳定性明显提升。",
+    from: "com.apple.Safari",
+    skipSensitive: true
+)
+if case .captured = normalDecision {
+    check("普通内容不被敏感规则误杀", true)
+} else {
+    check("普通内容不被敏感规则误杀", false, detail: String(describing: normalDecision))
+}
+
+let concealedType = "org.nspasteboard.ConcealedType"
+let transientType = "org.nspasteboard.TransientType"
+
+let concealedSecret = decide(
+    "Xk7m2Qp9vT4w9Zq",
+    from: "com.example.internal-secret-tool",
+    skipSensitive: false,
+    markers: [concealedType]
+)
+check(
+    "机密标记：名单外工具的密码不被记录",
+    concealedSecret == .confidentialSkipped,
+    detail: String(describing: concealedSecret)
+)
+
+let transientCopy = decide(
+    "程序自己放上去的临时内容",
+    from: "com.apple.Safari",
+    skipSensitive: false,
+    markers: [transientType]
+)
+check(
+    "临时标记：不被记录",
+    transientCopy == .confidentialSkipped,
+    detail: String(describing: transientCopy)
+)
+
+let unmarkedSameApp = decide(
+    "Xk7m2Qp9vT4w9Zq",
+    from: "com.example.internal-secret-tool",
+    skipSensitive: false
+)
+if case .captured(let item) = unmarkedSameApp {
+    check("无标记的同源内容照常记录", item.text == "Xk7m2Qp9vT4w9Zq")
+} else {
+    check(
+        "无标记的同源内容照常记录",
+        false,
+        detail: String(describing: unmarkedSameApp)
+    )
+}
+
+let sealedImagePB = NSPasteboard(
+    name: NSPasteboard.Name("ClipaFilterImage-\(UUID().uuidString)")
+)
+sealedImagePB.clearContents()
+sealedImagePB.setData(
+    Data(
+        base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )!,
+    forType: .png
+)
+sealedImagePB.setData(
+    Data("1".utf8),
+    forType: NSPasteboard.PasteboardType(concealedType)
+)
+settings.skipConfidentialPasteboard = true
+let sealedImage = monitor.evaluate(
+    pasteboard: sealedImagePB,
+    frontBundleID: "com.apple.Safari",
+    sourceName: "Safari",
+    settings: settings,
+    store: store
+)
+check(
+    "机密标记：图片同样不被记录",
+    sealedImage == .confidentialSkipped,
+    detail: String(describing: sealedImage)
+)
+
+let optedOut = decide(
+    "Xk7m2Qp9vT4w9Zq",
+    from: "com.example.internal-secret-tool",
+    skipSensitive: false,
+    markers: [concealedType],
+    skipConfidential: false
+)
+if case .captured(let item) = optedOut {
+    check("关闭开关后标记内容重新可记录", item.text == "Xk7m2Qp9vT4w9Zq")
+} else {
+    check(
+        "关闭开关后标记内容重新可记录",
+        false,
+        detail: String(describing: optedOut)
+    )
+}
+
+try? FileManager.default.removeItem(at: storeDir)
+defaults.removePersistentDomain(forName: suiteName)
+
+print("隐私过滤真实环境测试：通过 \(passed)，失败 \(failed)")
+if !failures.isEmpty {
+    print("失败明细：")
+    for item in failures {
+        print("  - \(item)")
+    }
+    exit(1)
+}

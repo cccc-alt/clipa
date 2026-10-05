@@ -1,0 +1,14 @@
+# Xcode / Swift
+.DS_Store
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+
+# Build products
+.build/
+dist/
+
+# OS
+.DS_Store
