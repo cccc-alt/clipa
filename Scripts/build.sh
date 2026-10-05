@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="2.4.0"
+VERSION="1.0.0"
 APP_NAME="Clipa"
 BUILD_DIR=".build/app"
 STAGE_DIR=".build/dmg-staging"
