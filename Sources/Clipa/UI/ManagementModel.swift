@@ -3,12 +3,13 @@ import Combine
 import Foundation
 
 enum ManagementPage: String, CaseIterable, Identifiable {
-    case general, workspaces, privacy, history, integrations, activity
+    case general, workspaces, collections, privacy, history, integrations, activity
     var id: String { rawValue }
     var title: String {
         switch self {
         case .general: return "通用"
         case .workspaces: return "工作区"
+        case .collections: return "资料集"
         case .privacy: return "隐私与过滤"
         case .history: return "历史与存储"
         case .integrations: return "应用集成"
@@ -19,6 +20,7 @@ enum ManagementPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "slider.horizontal.3"
         case .workspaces: return "square.stack.3d.up"
+        case .collections: return "folder"
         case .privacy: return "hand.raised"
         case .history: return "internaldrive"
         case .integrations: return "puzzlepiece.extension"
@@ -29,6 +31,7 @@ enum ManagementPage: String, CaseIterable, Identifiable {
         switch self {
         case .general: return "记录、启动与日常使用"
         case .workspaces: return "为不同场景保留独立的剪贴板历史"
+        case .collections: return "将当前工作区的参考内容按项目整理"
         case .privacy: return "决定哪些内容可以进入历史"
         case .history: return "管理当前工作区的容量与数据状态"
         case .integrations: return "控制其他本机程序的访问权限"
@@ -50,6 +53,7 @@ struct ManagementConfirmation {
         case revoke(String)
         case revokeAll
         case clearAudit
+        case deleteCollection(UUID, UUID)
     }
     let title: String
     let detail: String
@@ -61,6 +65,10 @@ enum ManagementSheet {
     case workspace(UUID?)
     case limit
     case token
+    case authorization(String)
+    case connect(IntegrationClient, String?)
+    case connectionReady
+    case collection(UUID?)
     case secret
     case confirmation(ManagementConfirmation)
 }
@@ -109,7 +117,10 @@ final class ManagementModel: ObservableObject {
     let tokenStore: APITokenStore
     @Published private(set) var store: ClipStore
     @Published var page: ManagementPage = .general {
-        didSet { if page != oldValue { notice = nil } }
+        didSet {
+            if page != oldValue { notice = nil }
+            if page == .collections { refreshCollections() }
+        }
     }
     @Published var sheet: ManagementSheet?
     @Published var notice: ManagementNotice?
@@ -124,6 +135,12 @@ final class ManagementModel: ObservableObject {
     @Published var secretRevealed = false
     @Published var secretSaved = false
     @Published var copyFeedback: String?
+    @Published private(set) var connectionResult: ClientInstallResult?
+    @Published private(set) var connectionDiagnostics: [UUID: String] = [:]
+    @Published private(set) var collections: [ClipCollection] = []
+    @Published private(set) var collectionError: String?
+    @Published private(set) var collectionsLoading = false
+    private var collectionTask: Task<Void, Never>?
 
     let switchWorkspace: (UUID) async throws -> ClipStore
     let changeAPI: (Bool) throws -> Void
@@ -132,6 +149,11 @@ final class ManagementModel: ObservableObject {
     var onPreferencesChanged: () -> Void = {}
     var openClipboard: () -> Void = {}
     var openOnboarding: () -> Void = {}
+    var openCollection: (UUID) -> Void = { _ in }
+    var helperBundleURL = Bundle.main.bundleURL
+    var installClientConfiguration: (IntegrationClient, UUID, URL, Bool) throws -> ClientInstallResult = {
+        try ClientConfigurationInstaller.install(client: $0, id: $1, helper: $2, replaceExisting: $3)
+    }
     private var subscriptions = Set<AnyCancellable>()
     private var storeSubscription: AnyCancellable?
 
@@ -157,6 +179,11 @@ final class ManagementModel: ObservableObject {
             publisher.sink { [weak self] _ in self?.objectWillChange.send() }.store(in: &subscriptions)
         }
         bindStore()
+        NotificationCenter.default.publisher(for: .clipaCollectionsChanged)
+            .sink { [weak self] notification in
+                guard let self, notification.object as? URL == self.store.dataDirectory else { return }
+                self.refreshCollections()
+            }.store(in: &subscriptions)
     }
 
     var isBusy: Bool { busy != nil }
@@ -171,17 +198,21 @@ final class ManagementModel: ObservableObject {
         guard store !== next else { return }
         storeSubscription = nil
         store = next
+        collections = []
         bindStore()
+        if page == .collections { refreshCollections() }
     }
     private func bindStore() {
         storeSubscription = store.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+            if self?.page == .collections { self?.refreshCollections() }
         }
     }
 
     func refresh() {
         tokenStore.reload()
         refreshAudit()
+        if page == .collections { refreshCollections() }
         objectWillChange.send()
     }
 
@@ -365,16 +396,26 @@ final class ManagementModel: ObservableObject {
                 try self.registry.delete(id)
                 self.report("「\(workspace.name)」已移到废纸篓。")
             case .revoke(let id):
+                let profile = self.tokenStore.tokens.first { $0.id == id }?.connectionID
                 guard self.tokenStore.revoke(id: id) else {
                     throw WorkflowError.message("撤销未保存，令牌仍有效。请检查数据目录权限后重试。")
                 }
                 if self.issuedToken?.token.id == id { self.issuedToken = nil }
                 self.report("令牌已撤销，该程序不能再用此令牌访问。")
+                if let profile {
+                    do { try ClientCredentials.remove(profile, root: self.registry.rootDirectory) }
+                    catch { self.report(error.localizedDescription, error: true) }
+                }
             case .revokeAll:
+                let profiles = self.tokenStore.tokens.compactMap(\.connectionID)
                 guard self.tokenStore.revokeAll() else {
                     throw WorkflowError.message("撤销未保存，现有令牌仍有效。请重试。")
                 }
                 self.report("所有令牌已撤销。")
+                for profile in profiles {
+                    do { try ClientCredentials.remove(profile, root: self.registry.rootDirectory) }
+                    catch { self.report(error.localizedDescription, error: true) }
+                }
             case .clearAudit:
                 guard APIAuditLog.clear(rootDirectory: self.registry.rootDirectory) else {
                     throw WorkflowError.message("调用记录未能清空，请检查目录权限后重试。")
@@ -382,6 +423,13 @@ final class ManagementModel: ObservableObject {
                 self.audit = []
                 self.auditError = nil
                 self.report("调用记录已清空，剪贴板历史未改变。")
+            case .deleteCollection(let workspace, let id):
+                try self.requireCurrentWorkspace(workspace)
+                guard let db = self.store.database else { throw WorkflowError.message("数据库暂不可用。") }
+                try await db.deleteCollection(id: id)
+                NotificationCenter.default.post(name: .clipaCollectionsChanged, object: self.store.dataDirectory)
+                self.refreshCollections()
+                self.report("资料集已删除，剪贴板历史仍保留。")
             }
             self.sheet = nil
         }
@@ -428,16 +476,21 @@ final class ManagementModel: ObservableObject {
         onPreferencesChanged()
     }
 
-    func createToken(name: String, scopes: Set<APIToken.Scope>, days: Int) {
+    func createToken(name: String, scopes: Set<APIToken.Scope>, days: Int, workspaceIDs: Set<UUID>? = nil) {
         guard issuedToken == nil, !isBusy else { return }
         if let error = WorkflowValidation.tokenName(name) { sheetError = error; return }
         guard !scopes.isEmpty else { sheetError = "至少选择一项权限。"; return }
+        let workspaces = workspaceIDs ?? [registry.activeID]
+        guard !workspaces.isEmpty, workspaces.isSubset(of: Set(registry.workspaces.map(\.id))) else {
+            sheetError = "请选择有效的工作区。"; return
+        }
         do {
             var scopes = scopes
             if scopes.contains(.searchText) { scopes.insert(.searchMeta) }
             let created = try tokenStore.create(
                 label: name, scopes: APIToken.Scope.allCases.filter { scopes.contains($0) },
-                expiresAt: days == 0 ? nil : Date().addingTimeInterval(Double(days) * 86_400))
+                expiresAt: days == 0 ? nil : Date().addingTimeInterval(Double(days) * 86_400),
+                workspaceIDs: registry.workspaces.map(\.id).filter(workspaces.contains))
             issuedToken = created
             secretRevealed = false
             secretSaved = false
@@ -445,6 +498,137 @@ final class ManagementModel: ObservableObject {
             sheetError = nil
             sheet = .secret
         } catch { sheetError = "令牌未创建：\(error.localizedDescription)" }
+    }
+
+    func saveAuthorization(id: String, scopes: Set<APIToken.Scope>, days: Int, workspaceIDs: Set<UUID>) {
+        guard !workspaceIDs.isEmpty, !scopes.isEmpty,
+              workspaceIDs.isSubset(of: Set(registry.workspaces.map(\.id))) else {
+            sheetError = "至少选择一个有效工作区和一项权限。"; return
+        }
+        do {
+            var scopes = scopes
+            if scopes.contains(.searchText) { scopes.insert(.searchMeta) }
+            try tokenStore.updateAuthorization(id: id, scopes: APIToken.Scope.allCases.filter(scopes.contains),
+                workspaceIDs: registry.workspaces.map(\.id).filter(workspaceIDs.contains),
+                expiresAt: days == 0 ? nil : Date().addingTimeInterval(Double(days) * 86_400))
+            sheet = nil
+            report("授权范围和有效期已更新。请重新启动 AI 客户端，刷新可用工具列表。")
+        } catch { sheetError = "授权未保存：\(error.localizedDescription)" }
+    }
+
+    func workspaceNames(for token: APIToken) -> String {
+        guard let ids = token.workspaceIDs, !ids.isEmpty else { return "需要确认工作区后恢复访问" }
+        return ids.map { id in registry.workspaces.first { $0.id == id }?.name ?? "已删除的工作区" }.joined(separator: "、")
+    }
+
+    func connectClient(_ client: IntegrationClient, existingID: String?, scopes: Set<APIToken.Scope>,
+                       workspaceIDs: Set<UUID>, days: Int, replaceExisting: Bool) {
+        guard !workspaceIDs.isEmpty, !scopes.isEmpty,
+              workspaceIDs.isSubset(of: Set(registry.workspaces.map(\.id))) else {
+            sheetError = "请选择有效工作区与权限。"; return
+        }
+        run("正在配置 \(client.title)…") {
+            let existing = existingID.flatMap { id in self.tokenStore.tokens.first { $0.id == id } }
+            let profileID = existing?.connectionID ?? UUID()
+            let helper = self.helperBundleURL.appendingPathComponent("Contents/Helpers/clipa-mcp")
+            guard FileManager.default.isExecutableFile(atPath: helper.path) else {
+                throw WorkflowError.message("请从已安装的 Clipa.app 中连接应用。")
+            }
+            if !self.settings.apiControlEnabled { try self.changeAPI(true) }
+            let installer = self.installClientConfiguration
+            let result: ClientInstallResult = try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do { continuation.resume(returning: try installer(client, profileID, helper, replaceExisting)) }
+                    catch { continuation.resume(throwing: error) }
+                }
+            }
+            var normalized = scopes
+            if normalized.contains(.searchText) { normalized.insert(.searchMeta) }
+            let grants = APIToken.Scope.allCases.filter(normalized.contains)
+            let workspaces = self.registry.workspaces.map(\.id).filter(workspaceIDs.contains)
+            let expires = days == 0 ? nil : Date().addingTimeInterval(Double(days) * 86_400)
+            if let existing, existing.connectionID != nil {
+                try self.tokenStore.updateAuthorization(id: existing.id, scopes: grants, workspaceIDs: workspaces, expiresAt: expires)
+                try self.tokenStore.rotate(id: existing.id) { secret in
+                    try ClientCredentials.write(ClientCredential(id: profileID, tokenID: existing.id,
+                        client: client, secret: secret, createdAt: Date()), root: self.registry.rootDirectory)
+                }
+            } else {
+                let created = try self.tokenStore.create(label: client.title, scopes: grants, expiresAt: expires,
+                                                        workspaceIDs: workspaces, connectionID: profileID)
+                do {
+                    try ClientCredentials.write(ClientCredential(id: profileID, tokenID: created.token.id,
+                        client: client, secret: created.secret, createdAt: Date()), root: self.registry.rootDirectory)
+                } catch {
+                    let revoked = self.tokenStore.revoke(id: created.token.id)
+                    throw WorkflowError.message(revoked ? "凭据未保存，新授权已撤销。请重试。"
+                        : "凭据未保存，且撤销未完成。请在授权列表中撤销此授权后重试。")
+                }
+            }
+            self.connectionResult = result
+            self.connectionDiagnostics[profileID] = "配置已保存，等待客户端调用"
+            self.sheet = .connectionReady
+            self.onPreferencesChanged()
+        }
+    }
+
+    func reconnect(_ token: APIToken) {
+        guard let id = token.connectionID else { present(.authorization(token.id)); return }
+        let client = (try? ClientCredentials.read(id, root: registry.rootDirectory))?.client ?? .custom
+        present(.connect(client, token.id))
+    }
+
+    func testConnection(_ token: APIToken) {
+        guard let id = token.connectionID else { return }
+        run("正在检测连接…") {
+            let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/clipa")
+            let output: (Int32, Data) = try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do { continuation.resume(returning: try ClientConfigurationInstaller.run(helper,
+                        ["diagnose", "--connection", id.uuidString, "--json", "--no-launch"])) }
+                    catch { continuation.resume(throwing: error) }
+                }
+            }
+            let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+            let response = try decoder.decode(APIResponse.self, from: output.1)
+            self.connectionDiagnostics[id] = response.diagnostic?.message ?? response.error?.message ?? "未能完成检测"
+            self.report(response.ok ? "本机检测通过。请在 AI 客户端调用 Clipa，完成端到端确认。"
+                        : (response.error?.message ?? "连接失败") + "。" + (response.error?.hint ?? "请重新连接。"), error: !response.ok)
+        }
+    }
+
+    func copyConnectionConfig() {
+        guard let config = connectionResult?.config else { return }
+        copyFeedback = SensitiveClipboard.copy(config) ? "配置已复制，其中不包含令牌。" : "复制失败，请重试。"
+    }
+
+    func refreshCollections() {
+        collectionTask?.cancel()
+        let source = store
+        collectionsLoading = true
+        collectionTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                guard let db = source.database else { throw WorkflowError.message("请先恢复数据库连接。") }
+                let items = try await db.listCollections()
+                guard !Task.isCancelled, let self, self.store === source else { return }
+                self.collections = items; self.collectionError = nil; self.collectionsLoading = false
+            } catch {
+                guard !Task.isCancelled, let self, self.store === source else { return }
+                self.collectionError = error.localizedDescription; self.collectionsLoading = false
+            }
+        }
+    }
+
+    func saveCollection(name: String, id: UUID?) {
+        run("正在保存资料集…") {
+            guard let db = self.store.database else { throw WorkflowError.message("数据库暂不可用。") }
+            _ = try await db.saveCollection(id: id, name: name)
+            self.sheet = nil
+            NotificationCenter.default.post(name: .clipaCollectionsChanged, object: self.store.dataDirectory)
+            self.refreshCollections()
+            self.report("资料集已保存。可在剪贴板条目的右键菜单中添加内容。")
+        }
     }
 
     func copyIssuedToken(format: String) {

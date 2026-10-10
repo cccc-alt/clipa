@@ -24,7 +24,7 @@ actor DatabaseManager {
         databaseExecutor.asUnownedSerialExecutor()
     }
 
-    private let connection: DatabaseConnection
+    let connection: DatabaseConnection
     let baseDirectory: URL
 
     /// True when every row carries normalized text, so the SQL exact-match
@@ -42,7 +42,7 @@ actor DatabaseManager {
         baseDirectory.appendingPathComponent(databaseFileName)
     }
 
-    init(baseDirectory: URL) throws {
+    init(baseDirectory: URL, trackSession: Bool = true) throws {
         self.baseDirectory = baseDirectory
         let databaseURL = Self.databaseURL(in: baseDirectory)
         try DatabaseFiles.protectDirectory(baseDirectory)
@@ -58,7 +58,7 @@ actor DatabaseManager {
             )
         )
         do {
-            try migration.migrateIfNeeded()
+            try migration.migrateIfNeeded(markSessionOpen: trackSession)
         } catch {
             // Tag migration failures so the store can tell "upgrade stalled"
             // apart from "file unreadable" and pick the right message.

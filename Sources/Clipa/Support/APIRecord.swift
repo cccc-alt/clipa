@@ -25,6 +25,7 @@ struct APIRecord: Codable, Equatable {
     /// 那会把"别人的目录结构"递出去，还会让这个接口变成文件读取器的入口。
     let text: String
     let note: String
+    var noteTruncated: Bool? = nil
 }
 
 extension APIRecord {

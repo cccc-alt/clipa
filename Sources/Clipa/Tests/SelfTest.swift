@@ -8188,7 +8188,11 @@ enum SelfTest {
             process.executableURL = URL(
                 fileURLWithPath: CommandLine.arguments[0]
             )
-            process.arguments = ["--mcp-stdio"]
+            process.arguments = ["--mcp-test-stdio", ClipStore.defaultBaseDirectory().path]
+            var environment = ProcessInfo.processInfo.environment
+            environment["CLIPA_TOKEN"] = "isolated-probe-invalid-token"
+            environment.removeValue(forKey: "CLIPA_CONNECTION")
+            process.environment = environment
             let input = Pipe()
             let output = Pipe()
             process.standardInput = input
@@ -8239,10 +8243,9 @@ enum SelfTest {
         let names = Set(tools.compactMap { $0["name"] as? String })
         expect(
             names == [
-                "clipa_status", "search_clips", "get_clip",
-                "copy_clip", "put_clip", "add_note", "delete_clip",
+                "clipa_status", "clipa_diagnose", "clipa_reconnect",
             ],
-            "工具清单与七个动词一一对应（\(names.sorted())）"
+            "未授权时只展示状态与恢复工具（\(names.sorted())）"
         )
 
         // 3. tools/call：回包应当是**可解析的 APIResponse 包络**，且被真实策略层
@@ -8277,6 +8280,7 @@ enum SelfTest {
         let gateCodes: Set<String> = [
             APIErrorCode.notEnabled.rawValue,
             APIErrorCode.notAuthorized.rawValue,
+            APIErrorCode.appNotRunning.rawValue,
         ]
         expect(
             envelope != nil

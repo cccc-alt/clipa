@@ -29,7 +29,7 @@ final class MigrationManager {
         self.imagesDirectory = imagesDirectory
     }
 
-    func migrateIfNeeded() throws {
+    func migrateIfNeeded(markSessionOpen: Bool = true) throws {
         // P1 修复（2026-10-02）：结构性判断用 require 版探针。折叠错误的
         // hasTable/hasColumn 会把"查询失败"当成"表/列不存在"——一次 IO 抖动
         // 就能把全新的 v12 库误导向 legacy 迁移路径，此后每次启动都失败。
@@ -163,8 +163,9 @@ final class MigrationManager {
         // of rewriting the whole index on every launch.
         try reconcileFTSIndex()
         try verifyConsistency()
-        try FTSRepository.markSessionOpen(connection: connection)
+        if markSessionOpen { try FTSRepository.markSessionOpen(connection: connection) }
 
+        try connection.exec(DatabaseSchema.collectionsTables)
         connection.setUserVersion(DatabaseSchema.currentUserVersion)
     }
 

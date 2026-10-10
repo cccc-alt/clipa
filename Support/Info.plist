@@ -19,9 +19,18 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2.7.0</string>
+	<string>2.8.0</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.clipa.connect</string>
+			<key>CFBundleURLSchemes</key>
+			<array><string>clipa</string></array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
-	<string>20</string>
+	<string>21</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>
@@ -31,7 +40,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>© 2026 Clipa. 本地优先 · 数据不出本机。</string>
+	<string>© 2026 Clipa. 本机加密存储。</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 </dict>

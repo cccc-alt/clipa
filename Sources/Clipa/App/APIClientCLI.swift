@@ -12,12 +12,21 @@ enum APIClientCLI {
 
     动词
       status                     查询接口是否开启、当前工作区、令牌作用域
+      diagnose                   检测应用、接口和授权状态，不读取剪贴板正文
+      connect                    打开 Clipa 的连接/重新授权页面
+      workspaces                 列出已授权工作区
       search <查询…>             检索历史（排序与面板一致）
       get <id>                   读取一条
       copy <id>                  把一条放进系统剪贴板
       put --text <内容>          把内容写进历史（省略 --text 时读标准输入）
       note <id> --text <备注>    给一条写备注
       delete <id>                删除一条历史（需要 delete 作用域，不可恢复）
+      collections                列出资料集
+      collection-create --name 名称
+      collection-rename --collection ID --name 名称
+      collection-delete --collection ID
+      collection-add --collection ID --ids UUID,UUID
+      collection-remove --collection ID --ids UUID,UUID
 
       id 说明
         get/copy/note 的 id 可以只写**前几位**（唯一即可，像 git 的短哈希）；
@@ -27,6 +36,15 @@ enum APIClientCLI {
     参数
       --limit N        检索条数（默认 10，上限 50）
       --offset N       search 跳过前 N 条，用于翻页（配合结果末尾的提示）
+      --workspace UUID 授权工作区；省略时固定使用授权中的首个工作区
+      --kind TYPE      text / image / file
+      --source APP     来源应用名称
+      --after ISO8601  最近复制时间下界（含）
+      --before ISO8601 最近复制时间上界（含）
+      --max-bytes N    get 正文页大小，默认 65536，上限 262144
+      --byte-offset N  get 正文字节偏移，使用返回的 next_byte_offset
+      --field NAME     get 读取 text 正文或 note 备注，默认 text
+      --connection ID 使用 Clipa 管理的连接；也可设置 CLIPA_CONNECTION
       --label NAME     put 的来源标签，默认用令牌名
       --token S        令牌；也可以放在 CLIPA_TOKEN 或 ~/.config/clipa/token
       --json           输出 JSON（错误也是 JSON），便于脚本解析
@@ -73,6 +91,17 @@ enum APIClientCLI {
             return nil
         }
 
+        if parsed.verb == "connect" {
+            let suffix = parsed.connection.map { "?connection=" + $0.uuidString } ?? ""
+            guard let url = URL(string: "clipa://connect" + suffix), NSWorkspace.shared.open(url) else {
+                return (.failure(.appNotRunning, "无法打开 Clipa，请从应用程序文件夹手动打开。"), 3)
+            }
+            var response = APIResponse(ok: true, schema: APIContract.protocolVersion)
+            response.diagnostic = APIDiagnostic(state: "approval_pending", message: "已打开 Clipa，等待用户确认授权。",
+                                                recovery: "在 Clipa 中确认工作区和权限后，重新运行检测。", connectionID: parsed.connection)
+            return (response, 0)
+        }
+
         let url = APIControlServer.socketURL(
             rootDirectory: ClipStore.defaultBaseDirectory()
         )
@@ -86,13 +115,16 @@ enum APIClientCLI {
             }
         }
         guard APIControlServer.canConnect(to: url) else {
+            let code: APIErrorCode = appIsRunning() ? .notEnabled : .appNotRunning
             return (
-                .failure(.notEnabled, "应用未在运行，或控制面未开启"),
-                APIErrorCode.notEnabled.exitCode
+                .failure(code, code == .appNotRunning ? "Clipa 未运行" : "接口未开启，或首次引导尚未完成"),
+                code.exitCode
             )
         }
 
-        let token = resolveToken(explicit: parsed.token)
+        let token: String
+        do { token = try resolveToken(explicit: parsed.token, connection: parsed.connection) }
+        catch { return (.failure(.notAuthorized, error.localizedDescription), 2) }
         guard !token.isEmpty else {
             return (
                 .failure(.notAuthorized, "没有令牌"),
@@ -111,13 +143,34 @@ enum APIClientCLI {
         request.args.note = parsed.note
         request.args.limit = parsed.limit
         request.args.offset = parsed.offset
+        request.args.workspaceID = parsed.workspaceID
+        request.args.kind = parsed.kind
+        request.args.source = parsed.source
+        request.args.after = parsed.after
+        request.args.before = parsed.before
+        request.args.maxBytes = parsed.maxBytes
+        request.args.byteOffset = parsed.byteOffset
+        request.args.collectionID = parsed.collectionID
+        request.args.name = parsed.name
+        request.args.ids = parsed.ids
+        request.args.field = parsed.field
 
-        guard let response = send(request, to: url, timeout: parsed.timeout)
+        guard var response = send(request, to: url, timeout: parsed.timeout)
         else {
             return (
                 .failure(.notEnabled, "连接失败或超时"),
                 APIErrorCode.notEnabled.exitCode
             )
+        }
+        if parsed.verb == "diagnose" {
+            response.diagnostic = APIDiagnostic(state: response.ok ? "ready" : response.error?.code ?? "unknown",
+                message: response.ok ? "本机接口与授权检测通过" : response.error?.message ?? "连接失败",
+                recovery: response.ok ? "让 AI 客户端调用 clipa_status，确认客户端配置已加载。" : response.error?.hint ?? "在 Clipa 中重新连接。",
+                connectionID: parsed.connection)
+            // Diagnostics do not disclose content, counts, workspace names or scopes.
+            response.status = nil
+            response.count = nil
+            response.workspaceID = nil
         }
         let exitCode: Int32
         if let code = response.error?.code,
@@ -139,8 +192,9 @@ enum APIClientCLI {
             .appendingPathComponent("token")
     }
 
-    private static func resolveToken(explicit: String?) -> String {
+    private static func resolveToken(explicit: String?, connection: UUID?) throws -> String {
         if let explicit, !explicit.isEmpty { return explicit }
+        if let connection { return try ClientCredentials.read(connection).secret }
         if let environment = ProcessInfo.processInfo.environment["CLIPA_TOKEN"],
            !environment.isEmpty {
             return environment.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -251,7 +305,7 @@ enum APIClientCLI {
     /// 这一步是**为了别白等**：只看 socket 的话，"应用开着、但接口没开"会先盲目地
     /// 去拉起应用再等满 5 秒才报错 —— 而那是最常见的一种失败，明明可以立刻回答。
     private static func appIsRunning() -> Bool {
-        guard let identifier = Bundle.main.bundleIdentifier else { return false }
+        let identifier = "com.clipa.desktop"
         return !NSRunningApplication
             .runningApplications(withBundleIdentifier: identifier)
             .isEmpty
@@ -259,7 +313,10 @@ enum APIClientCLI {
 
     /// 应用没在运行时试着拉起它（**不抢焦点**：`-g`）。
     private static func launchApp() {
-        let bundle = Bundle.main.bundleURL
+        var bundle = Bundle.main.bundleURL
+        if bundle.pathExtension != "app", let executable = Bundle.main.executableURL {
+            bundle = executable.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        }
         guard bundle.pathExtension == "app" else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
@@ -296,6 +353,7 @@ enum APIClientCLI {
             .prettyPrinted, .sortedKeys, .withoutEscapingSlashes
         ]
         encoder.keyEncodingStrategy = .convertToSnakeCase
+        encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(response),
               let text = String(data: data, encoding: .utf8) else {
             return "{}"
@@ -307,6 +365,9 @@ enum APIClientCLI {
         if let error = response.error {
             return "错误：\(error.message)"
         }
+        if let diagnostic = response.diagnostic { return diagnostic.message + "\n" + diagnostic.recovery }
+        if let collections = response.collections { return collections.map { "\($0.id)  \($0.name)  \($0.count) 条" }.joined(separator: "\n") }
+        if let workspaces = response.workspaces { return workspaces.map { "\($0.id)  \($0.name)" }.joined(separator: "\n") }
         if let status = response.status {
             return [
                 "应用：\(status.version)",
@@ -364,11 +425,41 @@ enum APIClientCLI {
         var note: String?
         var limit: Int?
         var offset: Int?
+        var workspaceID: UUID?
+        var connection: UUID?
+        var kind: String?
+        var source: String?
+        var after: String?
+        var before: String?
+        var maxBytes: Int?
+        var byteOffset: Int?
+        var collectionID: UUID?
+        var name: String?
+        var ids: [String]?
+        var field: String?
         var token: String?
         var timeout: TimeInterval = 5
         var json = false
         var help = false
         var noLaunch = false
+
+        /// MCP passes typed parameters directly. Clipboard text is never
+        /// reinterpreted as a CLI option (for example a literal "--help").
+        init?(verb: String, parameters: APIRequest.Arguments) {
+            self.verb = verb
+            query = parameters.query; id = parameters.id; text = parameters.text; label = parameters.label
+            note = parameters.note ?? (verb == "note" ? parameters.text : nil)
+            limit = parameters.limit; offset = parameters.offset; workspaceID = parameters.workspaceID
+            kind = parameters.kind; source = parameters.source; after = parameters.after; before = parameters.before
+            maxBytes = parameters.maxBytes; byteOffset = parameters.byteOffset
+            collectionID = parameters.collectionID; name = parameters.name; ids = parameters.ids
+            field = parameters.field
+            json = true; noLaunch = true
+            if let value = ProcessInfo.processInfo.environment["CLIPA_CONNECTION"] {
+                guard let id = UUID(uuidString: value) else { return nil }
+                connection = id
+            }
+        }
 
         init?(arguments: [String]) {
             var rest = arguments
@@ -379,6 +470,10 @@ enum APIClientCLI {
                 return
             }
             var words: [String] = []
+            if let raw = ProcessInfo.processInfo.environment["CLIPA_CONNECTION"] {
+                guard let id = UUID(uuidString: raw) else { return nil }
+                connection = id
+            }
             var index = 0
             while index < rest.count {
                 let argument = rest[index]
@@ -394,6 +489,21 @@ enum APIClientCLI {
                     return rest[index]
                 }
                 switch argument {
+                case "--field": field = value(argument); if field == nil { return nil }
+                case "--connection":
+                    guard let raw = value(argument), let id = UUID(uuidString: raw) else { return nil }; connection = id
+                case "--workspace":
+                    guard let raw = value(argument), let id = UUID(uuidString: raw) else { return nil }; workspaceID = id
+                case "--collection":
+                    guard let raw = value(argument), let id = UUID(uuidString: raw) else { return nil }; collectionID = id
+                case "--kind": kind = value(argument); if kind == nil { return nil }
+                case "--source": source = value(argument); if source == nil { return nil }
+                case "--after": after = value(argument); if after == nil { return nil }
+                case "--before": before = value(argument); if before == nil { return nil }
+                case "--name": name = value(argument); if name == nil { return nil }
+                case "--ids": ids = value(argument)?.split(separator: ",").map(String.init); if ids == nil { return nil }
+                case "--max-bytes": maxBytes = value(argument).flatMap(Int.init); if maxBytes == nil { return nil }
+                case "--byte-offset": byteOffset = value(argument).flatMap(Int.init); if byteOffset == nil { return nil }
                 case "--json": json = true
                 case "--help": help = true
                 case "--no-launch": noLaunch = true

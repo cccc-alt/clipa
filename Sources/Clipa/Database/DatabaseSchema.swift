@@ -44,7 +44,23 @@ enum DatabaseSchema {
     /// moves anyway so an older build cannot mistake an encrypted store for one
     /// it understands — and `clips.text` for those rows no longer holds anything
     /// that build could show.
-    static let currentUserVersion = 12
+    // v13: workspace-local collections and memberships, inside SQLCipher.
+    static let currentUserVersion = 13
+
+    static let collectionsTables = """
+        CREATE TABLE IF NOT EXISTS clip_collections (
+            id TEXT PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            name_key TEXT NOT NULL UNIQUE,
+            created_at REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS clip_collection_members (
+            collection_id TEXT NOT NULL REFERENCES clip_collections(id) ON DELETE CASCADE,
+            clip_id TEXT NOT NULL REFERENCES clips(id) ON DELETE CASCADE,
+            PRIMARY KEY(collection_id, clip_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_collection_clip ON clip_collection_members(clip_id);
+        """
 
     // The select column list must stay in sync with ClipRepository.clip(from:).
     // content_hash 13, smart_tag 14,

@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var onboardingStorage: OnboardingWindowController?
     private var runtimeStarted = false
     private var returnToSettingsAfterOnboarding = false
+    private var pendingConnectionURL: URL?
     private var management: ManagementWindowController {
         if let managementStorage { return managementStorage }
         let model = ManagementModel(
@@ -46,6 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.quickStrip.show()
         }
         model.openOnboarding = { [weak self] in self?.showOnboarding(replaying: true) }
+        model.openCollection = { [weak self] id in
+            guard let self else { return }
+            self.managementStorage?.window?.orderOut(nil)
+            self.quickStrip.viewModel.selectCollection(id)
+            self.quickStrip.show()
+        }
         let controller = ManagementWindowController(model: model)
         managementStorage = controller
         return controller
@@ -110,6 +117,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showSettingsAction() { showManagement() }
 
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first, url.scheme == "clipa", url.host == "connect" else { return }
+        if !runtimeStarted { pendingConnectionURL = url; showOnboarding(); return }
+        guard showManagement(.integrations) else { return }
+        let raw = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "connection" }?.value
+        if let raw, let id = UUID(uuidString: raw),
+           let token = APITokenStore.shared.tokens.first(where: { $0.connectionID == id }) {
+            management.model.reconnect(token)
+        } else {
+            management.model.report("请选择要连接的应用，并确认工作区与权限。")
+        }
+    }
+
     private func showOnboarding(replaying: Bool = false) {
         if let center = managementStorage, center.model.sheet != nil || center.model.isBusy {
             center.show(page: center.model.page)
@@ -128,6 +148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self else { return }
                     if !self.runtimeStarted { self.startRuntime() }
                     self.refreshStatusIcon()
+                    if let url = self.pendingConnectionURL {
+                        self.pendingConnectionURL = nil
+                        self.application(NSApp, open: [url])
+                        return
+                    }
                     if showClipboard {
                         if ClipStore.shared.availability.isReady { self.quickStrip.show() }
                         else { self.showManagement(.history) }

@@ -32,6 +32,8 @@ struct APIToken: Codable, Equatable, Identifiable {
         case put
         case note
         case delete
+        case collectionsRead = "collections.read"
+        case collectionsWrite = "collections.write"
 
         var title: String {
             switch self {
@@ -42,14 +44,16 @@ struct APIToken: Codable, Equatable, Identifiable {
             case .put: return "把内容写进历史"
             case .note: return "写备注"
             case .delete: return "删除历史条目"
+            case .collectionsRead: return "查看资料集"
+            case .collectionsWrite: return "整理资料集"
             }
         }
 
         /// 写能力：默认一律不给，要勾才给。
         var isWrite: Bool {
             switch self {
-            case .searchMeta, .searchText, .readFull: return false
-            case .copy, .put, .note, .delete: return true
+            case .searchMeta, .searchText, .readFull, .collectionsRead: return false
+            case .copy, .put, .note, .delete, .collectionsWrite: return true
             }
         }
     }
@@ -66,6 +70,11 @@ struct APIToken: Codable, Equatable, Identifiable {
     var expiresAt: Date?
     var lastUsedAt: Date?
     var callCount: Int
+    /// nil is a legacy grant that must be reconfirmed, never a wildcard.
+    var workspaceIDs: [UUID]? = nil
+    var connectionID: UUID? = nil
+
+    func allows(workspaceID: UUID) -> Bool { workspaceIDs?.contains(workspaceID) == true }
 
     func allows(_ scope: Scope) -> Bool {
         scopes.contains(scope)
@@ -155,7 +164,9 @@ final class APITokenStore: ObservableObject {
     func create(
         label: String,
         scopes: [APIToken.Scope],
-        expiresAt: Date? = nil
+        expiresAt: Date? = nil,
+        workspaceIDs: [UUID]? = nil,
+        connectionID: UUID? = nil
     ) throws -> (token: APIToken, secret: String) {
         guard loadError == nil else { throw APIToken.TokenError.storageUnavailable }
         let secret = Self.generateSecret()
@@ -173,7 +184,9 @@ final class APITokenStore: ObservableObject {
             createdAt: Date(),
             expiresAt: expiresAt,
             lastUsedAt: nil,
-            callCount: 0
+            callCount: 0,
+            workspaceIDs: workspaceIDs ?? [WorkspaceStore.shared.activeID],
+            connectionID: connectionID
         )
         let snapshot = tokens
         tokens.append(token)
@@ -183,6 +196,40 @@ final class APITokenStore: ObservableObject {
             throw error
         }
         return (token, secret)
+    }
+
+    func updateAuthorization(id: String, scopes: [APIToken.Scope], workspaceIDs: [UUID], expiresAt: Date?) throws {
+        guard !workspaceIDs.isEmpty, let index = tokens.firstIndex(where: { $0.id == id }) else {
+            throw APIToken.TokenError.storageUnavailable
+        }
+        let previous = tokens
+        tokens[index].scopes = scopes
+        var seen = Set<UUID>()
+        tokens[index].workspaceIDs = workspaceIDs.filter { seen.insert($0).inserted }
+        tokens[index].expiresAt = expiresAt
+        do { try save() } catch { tokens = previous; throw error }
+    }
+
+    /// Replace a managed connection's credential only after its new grant is
+    /// persisted. If writing the private credential fails, restore the grant.
+    func rotate(id: String, persistCredential: (String) throws -> Void) throws {
+        guard let index = tokens.firstIndex(where: { $0.id == id }) else { throw APIToken.TokenError.storageUnavailable }
+        let secret = Self.generateSecret()
+        guard let hash = Self.hash(secret) else { throw APIToken.TokenError.hashFailed }
+        let previous = tokens
+        let old = tokens[index]
+        tokens[index] = APIToken(id: old.id, label: old.label, tokenHash: hash, scopes: old.scopes,
+                                createdAt: old.createdAt, expiresAt: old.expiresAt, lastUsedAt: nil,
+                                callCount: old.callCount, workspaceIDs: old.workspaceIDs, connectionID: old.connectionID)
+        do {
+            try save()
+            try persistCredential(secret)
+        } catch {
+            tokens = previous
+            do { try save() }
+            catch { loadError = "凭据更新失败，且无法恢复原授权。请修复存储后重新连接。" }
+            throw error
+        }
     }
 
     /// 撤销一个令牌。**持久化失败会回滚内存并返回 false**——P2 修复
@@ -237,6 +284,12 @@ final class APITokenStore: ObservableObject {
             }
         }
         return nil
+    }
+
+    func failureCode(secret: String) -> APIErrorCode {
+        guard let digest = Self.hash(secret) else { return .notAuthorized }
+        return tokens.contains { Self.constantTimeEquals($0.tokenHash, digest) && $0.isExpired }
+            ? .tokenExpired : .notAuthorized
     }
 
     /// 记录一次使用。落盘**节流**（P2/P3 修复 2026-10-03）：lastUsedAt/callCount

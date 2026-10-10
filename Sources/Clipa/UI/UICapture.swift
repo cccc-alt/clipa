@@ -281,6 +281,15 @@ enum UICapture {
             vm.refreshSearch()
         }
         if CommandLine.arguments.contains("--ui-preview") { vm.openPreview() }
+        if CommandLine.arguments.contains("--ui-collection"), let db = store.database,
+           let id = try? DatabaseSync.run(db, { db in
+               let id = try await db.saveCollection(name: "项目参考")
+               let clips = try await db.loadRecentClips(limit: 3)
+               try await db.changeCollectionMembers(id: id, clips: clips.filter { !$0.isPrivate }.map(\.id), adding: true)
+               return id
+           }) {
+            vm.selectCollection(id)
+        }
         if CommandLine.arguments.contains("--ui-note-error") {
             vm.openNoteEditor(vm.firstResultItem)
             vm.noteDraft = "这是一条尚未保存的备注草稿"

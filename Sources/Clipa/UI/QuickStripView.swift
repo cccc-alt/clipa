@@ -257,6 +257,19 @@ struct QuickStripView: View {
             .accessibilityLabel("筛选内容类型")
             .disabled(!vm.store.availability.isReady || vm.noteIsSaving || vm.copyingID != nil)
             Spacer(minLength: 4)
+            Menu {
+                Button("全部资料") { vm.selectCollection(nil) }
+                ForEach(vm.collections) { collection in
+                    Button(collection.name) { vm.selectCollection(collection.id) }
+                }
+                Divider()
+                Button("管理资料集…") { AppDelegate.shared?.showManagement(.collections) }
+            } label: {
+                Label(vm.selectedCollectionName ?? "资料集", systemImage: "folder")
+                    .lineLimit(1).frame(maxWidth: 90)
+            }
+            .menuStyle(.borderlessButton).fixedSize()
+            .disabled(vm.noteIsSaving || vm.copyingID != nil)
             Button { AppDelegate.shared?.showManagement(.workspaces) } label: {
                 Label(WorkspaceStore.shared.activeWorkspace.name, systemImage: "square.stack.3d.up")
                     .font(.system(size: 11)).lineLimit(1).frame(maxWidth: 110)
@@ -472,6 +485,15 @@ struct QuickStripView: View {
     private var emptyState: some View {
         if let reason = vm.store.availability.reason {
             storeUnavailableView(reason: reason)
+        } else if vm.selectedCollectionID != nil && vm.collectionLoading {
+            ProgressView("正在读取资料集…").frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if vm.selectedCollectionID != nil && vm.query.isEmpty && vm.kindFilter == nil && vm.smartTagFilter == nil {
+            VStack(spacing: 12) {
+                Image(systemName: "folder").font(.system(size: 34, weight: .light)).foregroundStyle(.secondary)
+                Text("资料集暂无可显示的内容").font(.headline)
+                Text("在历史条目的右键菜单中选择“加入资料集”。").font(.callout).foregroundStyle(.secondary)
+                Button("返回全部历史") { vm.selectCollection(nil) }
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if vm.store.items.isEmpty {
             emptyHistoryView
         } else {
@@ -514,6 +536,7 @@ struct QuickStripView: View {
             Text("试试更短的关键词，或切换到全部类型。")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
             Button("清除搜索和筛选") {
+                vm.selectCollection(nil)
                 vm.query = ""
                 vm.kindFilter = nil
                 vm.smartTagFilter = nil
@@ -1126,6 +1149,18 @@ struct SpotlightRowView: View {
             vm.openNoteEditor(item)
         } label: {
             Label("添加 / 编辑备注", systemImage: "square.and.pencil")
+        }
+        if !item.isPrivate {
+            Menu("加入资料集") {
+                ForEach(vm.collections) { collection in
+                    Button(collection.name) { vm.changeCollection(collection.id, item: item, adding: true) }
+                }
+                Divider()
+                Button("新建或管理资料集…") { AppDelegate.shared?.showManagement(.collections) }
+            }
+            if let collection = vm.selectedCollectionID {
+                Button("从此资料集移除") { vm.changeCollection(collection, item: item, adding: false) }
+            }
         }
         Divider()
         Button(role: .destructive) {

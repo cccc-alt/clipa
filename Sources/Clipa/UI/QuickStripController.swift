@@ -303,6 +303,7 @@ final class QuickStripController: NSObject {
         visibilityGeneration &+= 1
         viewModel.activeSurface = .quickStrip
         viewModel.openTick += 1
+        viewModel.refreshCollections()
         // Already open and settled: the hotkey doubles as a "bring it forward"
         // gesture, and re-running the slide made the panel dive off the bottom
         // edge and rise again for no reason. Focus is re-asserted either way.

@@ -7,6 +7,15 @@ import Foundation
 // 按普通失败处理；各 socket 另设 SO_NOSIGPIPE（见 SocketProtection），双保险。
 signal(SIGPIPE, SIG_IGN)
 
+// Explicit child-process probe mode: even MCP discovery must never consult
+// the developer's real socket or stored credential during automated checks.
+if let index = CommandLine.arguments.firstIndex(of: "--mcp-test-stdio"), index + 1 < CommandLine.arguments.count {
+    let root = URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true)
+    ClipStore.defaultBaseDirectoryOverride = root
+    APITokenStore.directoryOverride = root
+    exit(APIMcp.run())
+}
+
 // 以 `clipa` 这个名字被调用（App 包里那个助手）时，整个进程就是一个 CLI 客户端：
 // 不启动 GUI、不读数据库，只把请求转给正在运行的应用。**必须在任何探针分支之前**，
 // 否则 `clipa status` 会先被别的 flag 分支接走。
@@ -96,6 +105,11 @@ if CommandLine.arguments.contains(where: { $0.hasPrefix("--capture-ui") || $0 ==
 if CommandLine.arguments.contains("--workflow-probe") {
     useIsolatedStoreForCLIMode()
     Task { @MainActor in exit(await WorkflowProbe.run()) }
+    dispatchMain()
+}
+if CommandLine.arguments.contains("--integration-probe") {
+    useIsolatedStoreForCLIMode()
+    Task { @MainActor in exit(await IntegrationProbe.run()) }
     dispatchMain()
 }
 if let path = argumentValue("--capture-settings") {

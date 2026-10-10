@@ -71,6 +71,13 @@ final class PanelViewModel: ObservableObject {
     // UI state
     @Published var kindFilter: ClipKind?
     @Published var smartTagFilter: SmartTag?
+    @Published private(set) var collections: [ClipCollection] = []
+    @Published private(set) var selectedCollectionID: UUID?
+    @Published private(set) var collectionLoading = false
+    private var collectionMembers = Set<UUID>()
+    private var collectionTask: Task<Void, Never>?
+    private var collectionMutationInFlight = false
+    var selectedCollectionName: String? { collections.first { $0.id == selectedCollectionID }?.name }
     @Published var isSearchFieldFocused = false
     /// Which surface currently owns the keyboard.
     ///
@@ -214,6 +221,11 @@ final class PanelViewModel: ObservableObject {
     /// Wires up everything that follows the store, so a workspace switch can
     /// re-do exactly this against the new store.
     private func subscribeToStores() {
+        NotificationCenter.default.publisher(for: .clipaCollectionsChanged)
+            .sink { [weak self] notification in
+                guard let self, notification.object as? URL == self.store.dataDirectory else { return }
+                self.refreshCollections()
+            }.store(in: &cancellables)
         store.itemsPublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
@@ -251,6 +263,12 @@ final class PanelViewModel: ObservableObject {
     /// them, otherwise the previous workspace's history stays resident — which
     /// is what made an empty workspace cost 530MB.
     private func releaseStoreBoundState() {
+        collectionTask?.cancel()
+        collectionTask = nil
+        collections = []
+        selectedCollectionID = nil
+        collectionMembers = []
+        collectionLoading = false
         suspendNoteEditor()
         previewID = nil
         noteOperation = nil
@@ -385,6 +403,7 @@ final class PanelViewModel: ObservableObject {
     /// text or a type filter.
     var hasActiveFilter: Bool {
         isFiltering
+            || selectedCollectionID != nil
             || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -419,15 +438,66 @@ final class PanelViewModel: ObservableObject {
         filter: SearchFilter,
         preserveWindow: Bool = false
     ) {
-        clips = result.clips
+        let visible = selectedCollectionID == nil ? result.clips
+            : result.clips.filter { collectionMembers.contains($0.id) && !$0.isPrivate && !$0.isHidden }
+        clips = visible
         results = ClipGrouper.group(
-            clips: result.clips,
+            clips: visible,
             calendar: .current,
             now: Date()
         )
         navigationOrder = results.flatMap(\.clips).map(\.id)
         rebuildListEntries(preserveWindow: preserveWindow)
         reconcileSelection(with: navigationOrder)
+    }
+
+    func selectCollection(_ id: UUID?) {
+        guard !noteIsSaving, copyingID == nil, !privateUnlockInFlight else { return }
+        selectedCollectionID = id
+        collectionMembers = []
+        refreshActiveQuery()
+        refreshCollections()
+    }
+
+    func refreshCollections() {
+        collectionTask?.cancel()
+        let source = store, target = selectedCollectionID
+        collectionLoading = true
+        collectionTask = Task { [weak self] in
+            do {
+                guard let db = source.database else { throw WorkflowError.message("数据库暂不可用。") }
+                let collections = try await db.listCollections()
+                let exists = target.map { id in collections.contains { $0.id == id } } ?? true
+                let members: Set<UUID>
+                if let target, exists { members = try await db.collectionMembers(id: target) }
+                else { members = [] }
+                guard !Task.isCancelled, let self, self.store === source, self.selectedCollectionID == target else { return }
+                self.collections = collections
+                if !exists { self.selectedCollectionID = nil; self.showToast("资料集已删除，已返回全部历史") }
+                self.collectionMembers = members
+                self.collectionLoading = false
+                if target != nil { self.refreshActiveQuery() }
+            } catch {
+                guard !Task.isCancelled, let self, self.store === source else { return }
+                self.collectionLoading = false
+                if target != nil { self.collectionMembers = []; self.refreshActiveQuery(); self.showToast("资料集读取失败，请重试") }
+            }
+        }
+    }
+
+    func changeCollection(_ collection: UUID, item: Clip, adding: Bool) {
+        guard !collectionMutationInFlight, !item.isPrivate, !item.isHidden else { return }
+        collectionMutationInFlight = true
+        let source = store
+        Task { [weak self] in
+            defer { self?.collectionMutationInFlight = false }
+            do {
+                guard let db = source.database else { throw WorkflowError.message("数据库暂不可用。") }
+                try await db.changeCollectionMembers(id: collection, clips: [item.id], adding: adding)
+                NotificationCenter.default.post(name: .clipaCollectionsChanged, object: source.dataDirectory)
+                if self?.store === source { self?.showToast(adding ? "已加入资料集" : "已从资料集移除，历史仍保留") }
+            } catch { if self?.store === source { self?.showToast(error.localizedDescription) } }
+        }
     }
 
     // MARK: - Rendered list window

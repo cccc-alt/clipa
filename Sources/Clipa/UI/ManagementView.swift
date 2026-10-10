@@ -100,6 +100,9 @@ struct ManagementView: View {
             } else if model.page == .activity {
                 Button("刷新", systemImage: "arrow.clockwise") { model.refreshAudit() }
                     .disabled(model.isBusy)
+            } else if model.page == .collections {
+                Button("新建资料集", systemImage: "plus") { model.present(.collection(nil)) }
+                    .disabled(model.isBusy || !model.store.availability.isReady)
             }
         }
         .padding(24)
@@ -109,6 +112,7 @@ struct ManagementView: View {
         switch model.page {
         case .general: general
         case .workspaces: workspaces
+        case .collections: collections
         case .privacy: privacy
         case .history: history
         case .integrations: integrations
@@ -335,12 +339,21 @@ struct ManagementView: View {
 
     private var integrations: some View {
         Form {
+            Section("连接 AI 应用") {
+                HStack {
+                    ForEach(IntegrationClient.allCases) { client in
+                        Button(client.title) { model.present(.connect(client, nil)) }
+                    }
+                }
+                Text("选择应用、确认工作区与权限后自动保存连接配置。自定义客户端可复制配置。凭据单独保存在仅当前用户可读的文件中。")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             Section("本地接口") {
                 Toggle("允许授权程序访问", isOn: Binding(
                     get: { model.settings.apiControlEnabled }, set: { model.setAPIEnabled($0) }
                 ))
                 LabeledContent("运行状态", value: model.apiIsRunning() ? "已开启，仅本机可连接" : "未运行")
-                Text("每个程序使用独立令牌，并按所选权限访问。关闭接口后所有程序暂停访问；私密内容始终不可访问。")
+                Text("每个程序按授权的工作区和权限访问。连接在本机完成；AI 客户端可能将读取内容发送至模型服务。私密内容始终不可访问。")
                     .font(.callout).foregroundStyle(.secondary)
             }
             Section("已授权程序") {
@@ -361,6 +374,9 @@ struct ManagementView: View {
                                 Label(token.label, systemImage: "app.connected.to.app.below.fill").font(.headline)
                                 Spacer()
                                 if token.isExpired { Text("已过期").foregroundStyle(.orange).font(.caption) }
+                                Button(token.workspaceIDs == nil ? "确认工作区…" : "管理授权…") {
+                                    model.present(.authorization(token.id))
+                                }
                                 Button("撤销…", role: .destructive) {
                                     model.present(.confirmation(ManagementConfirmation(
                                         title: "撤销「\(token.label)」的授权？",
@@ -370,6 +386,20 @@ struct ManagementView: View {
                             }
                             Text(token.scopes.map(\.uiTitle).joined(separator: " · "))
                                 .font(.callout).foregroundStyle(.secondary)
+                            Text("工作区：" + model.workspaceNames(for: token))
+                                .font(.caption).foregroundStyle(token.workspaceIDs == nil ? Color.orange : .secondary)
+                            if let connectionID = token.connectionID {
+                                HStack {
+                                    Button("检测连接") { model.testConnection(token) }
+                                    Button("重新连接…") { model.reconnect(token) }
+                                }
+                                if let state = model.connectionDiagnostics[connectionID] {
+                                    Text(state).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            Text(token.lastUsedAt.map { "最近调用：" + $0.formatted(date: .abbreviated, time: .shortened) }
+                                 ?? "尚无客户端调用记录")
+                                .font(.caption).foregroundStyle(.secondary)
                             Text("\(token.id) · 已使用 \(token.callCount) 次 · "
                                  + (token.expiresAt.map { "到期：" + $0.formatted(date: .numeric, time: .omitted) } ?? "不过期"))
                                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
@@ -380,6 +410,44 @@ struct ManagementView: View {
                             title: "撤销全部 \(model.tokenStore.tokens.count) 个授权？",
                             detail: "所有使用现有令牌的程序都会立即失去访问权限。此操作不能撤销。",
                             button: "撤销全部", action: .revokeAll)))
+                    }
+                }
+            }
+        }.formStyle(.grouped)
+    }
+
+    private var collections: some View {
+        Form {
+            Section("当前工作区 · " + model.workspaceName) {
+                Text("资料集只保存条目关联，不复制正文。删除资料集不会删除历史；私密和隐藏条目不在资料集中展示。")
+                    .font(.callout).foregroundStyle(.secondary)
+                if model.collectionsLoading { ProgressView("正在读取资料集…") }
+                if let error = model.collectionError {
+                    Label(error, systemImage: "exclamationmark.circle").foregroundStyle(.orange)
+                    Button("重试") { model.refreshCollections() }
+                } else if model.collections.isEmpty && !model.collectionsLoading {
+                    Text("还没有资料集").font(.headline)
+                    Text("例如“项目参考”“会议资料”。创建后，在剪贴板条目上右键选择“加入资料集”。")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            ForEach(model.collections) { collection in
+                Section {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label(collection.name, systemImage: "folder").font(.headline)
+                            Text("\(collection.count) 条内容").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("打开") { model.openCollection(collection.id) }
+                        Menu {
+                            Button("重命名…") { model.present(.collection(collection.id)) }
+                            Button("删除资料集…", role: .destructive) {
+                                model.present(.confirmation(ManagementConfirmation(title: "删除「\(collection.name)」？",
+                                    detail: "仅删除资料集与成员关联，原有剪贴板历史仍保留。", button: "删除资料集",
+                                    action: .deleteCollection(model.registry.activeID, collection.id))))
+                            }
+                        } label: { Image(systemName: "ellipsis") }.fixedSize()
                     }
                 }
             }
@@ -460,6 +528,8 @@ extension APIToken.Scope {
         case .put: return "添加历史"
         case .note: return "修改备注"
         case .delete: return "删除历史"
+        case .collectionsRead: return "查看资料集"
+        case .collectionsWrite: return "整理资料集"
         }
     }
     var uiDetail: String {
@@ -471,6 +541,8 @@ extension APIToken.Scope {
         case .put: return "仍遵守暂停记录、敏感内容和忽略应用规则。"
         case .note: return "允许修改历史条目的备注。"
         case .delete: return "允许永久删除非私密历史，请谨慎授权。"
+        case .collectionsRead: return "查看资料集及按资料集筛选，正文仍由读取权限控制。"
+        case .collectionsWrite: return "创建、重命名资料集或调整成员；删除资料集不会删除历史。"
         }
     }
 }

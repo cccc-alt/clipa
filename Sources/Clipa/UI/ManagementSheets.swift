@@ -9,9 +9,36 @@ struct ManagementSheetView: View {
         case .workspace(let id): WorkspaceNameForm(model: model, workspaceID: id)
         case .limit: HistoryLimitForm(model: model)
         case .token: TokenPermissionForm(model: model)
+        case .authorization(let id): TokenPermissionForm(model: model, editingID: id)
+        case .connect(let client, let id): TokenPermissionForm(model: model, editingID: id, client: client)
+        case .connectionReady: ConnectionReceiptView(model: model)
+        case .collection(let id): CollectionNameForm(model: model, collectionID: id)
         case .secret: TokenReceiptView(model: model)
         case .confirmation(let confirmation): ConfirmationForm(model: model, confirmation: confirmation)
         case nil: EmptyView()
+        }
+    }
+}
+
+@MainActor
+private struct CollectionNameForm: View {
+    @ObservedObject var model: ManagementModel
+    let collectionID: UUID?
+    @State private var name = ""
+    @FocusState private var focused: Bool
+    var body: some View {
+        SheetLayout(model: model, title: collectionID == nil ? "新建资料集" : "重命名资料集",
+                    detail: "保存在「\(model.workspaceName)」中。名称为 1–60 个字，不能重复。") {
+            TextField("例如：项目参考", text: $name).textFieldStyle(.roundedBorder).focused($focused)
+        } actions: {
+            Button("取消") { model.dismissSheet() }.keyboardShortcut(.cancelAction)
+            Button("保存") { model.saveCollection(name: name, id: collectionID) }
+                .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+                .disabled((try? IntegrationValidation.name(name)) == nil)
+        }
+        .onAppear {
+            name = model.collections.first { $0.id == collectionID }?.name ?? ""
+            focused = true
         }
     }
 }
@@ -136,20 +163,33 @@ private struct HistoryLimitForm: View {
 @MainActor
 private struct TokenPermissionForm: View {
     @ObservedObject var model: ManagementModel
+    var editingID: String? = nil
+    var client: IntegrationClient? = nil
     @State private var name = ""
     @State private var scopes: Set<APIToken.Scope> = [.searchMeta, .searchText]
     @State private var days = 30
+    @State private var workspaceIDs = Set<UUID>()
+    @State private var replaceExisting = false
     @FocusState private var focused: Bool
-    private var valid: Bool { WorkflowValidation.tokenName(name) == nil && !scopes.isEmpty }
+    private var valid: Bool { WorkflowValidation.tokenName(name) == nil && !scopes.isEmpty && !workspaceIDs.isEmpty }
 
     var body: some View {
-        SheetLayout(model: model, title: "授权一个程序",
-                    detail: "为每个程序创建独立令牌。默认只允许搜索与预览，私密内容始终不开放。") {
+        SheetLayout(model: model, title: client.map { "连接 " + $0.title } ?? (editingID == nil ? "授权一个程序" : "管理授权"),
+                    detail: "选择程序可以访问的工作区与操作。连接发生在本机；AI 客户端可能将获准读取的内容发送到其模型服务。私密内容始终不开放。") {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     TextField("程序名称，例如 Codex 或 Cursor", text: $name)
                         .textFieldStyle(.roundedBorder).focused($focused)
                         .accessibilityLabel("授权程序名称")
+                        .disabled(editingID != nil || client != nil)
+                    if let client {
+                        Text(client.configURL(home: FileManager.default.homeDirectoryForCurrentUser)?.path ?? "完成后复制配置到客户端。")
+                            .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        if client != .custom {
+                            Toggle("替换已有 Clipa 配置（写入前备份）", isOn: $replaceExisting)
+                                .toggleStyle(.checkbox)
+                        }
+                    }
                     if let error = WorkflowValidation.tokenName(name), !name.isEmpty {
                         Text(error).font(.caption).foregroundStyle(.orange)
                     }
@@ -158,6 +198,19 @@ private struct TokenPermissionForm: View {
                         Text("90 天").tag(90)
                         Text("不过期").tag(0)
                     }
+                    Text(editingID == nil ? "有效期从创建时开始计算。" : "保存后将从现在重新计算有效期。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Divider()
+                    Text("允许访问的工作区").font(.headline)
+                    Text("未指定工作区时使用列表中第一个已选工作区。读取和资料整理不会切换当前界面。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(model.registry.workspaces) { workspace in
+                        Toggle(workspace.name, isOn: Binding(
+                            get: { workspaceIDs.contains(workspace.id) },
+                            set: { if $0 { workspaceIDs.insert(workspace.id) } else { workspaceIDs.remove(workspace.id) } }
+                        )).toggleStyle(.checkbox)
+                    }
+                    if workspaceIDs.isEmpty { Text("至少选择一个工作区。").font(.caption).foregroundStyle(.orange) }
                     Divider()
                     Text("读取").font(.headline)
                     ForEach(APIToken.Scope.allCases.filter { !$0.isWrite }, id: \.self) { scope in
@@ -172,12 +225,26 @@ private struct TokenPermissionForm: View {
                 }
             }.frame(maxHeight: 370)
         } actions: {
+            Text("\(workspaceIDs.count) 个工作区 · " + (scopes.contains(where: \.isWrite) ? "含操作权限" : "只读"))
+                .font(.caption).foregroundStyle(.secondary)
             Button("取消") { model.dismissSheet() }.keyboardShortcut(.cancelAction)
-            Button("创建令牌") { model.createToken(name: name, scopes: scopes, days: days) }
+            Button(client != nil ? "确认并连接" : editingID == nil ? "创建令牌" : "保存授权") {
+                if let client { model.connectClient(client, existingID: editingID, scopes: scopes, workspaceIDs: workspaceIDs, days: days, replaceExisting: replaceExisting) }
+                else if let editingID { model.saveAuthorization(id: editingID, scopes: scopes, days: days, workspaceIDs: workspaceIDs) }
+                else { model.createToken(name: name, scopes: scopes, days: days, workspaceIDs: workspaceIDs) }
+            }
                 .buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
                 .disabled(!valid || model.tokenStore.loadError != nil)
         }
-        .onAppear { focused = true }
+        .onAppear {
+            if let editingID, let token = model.tokenStore.tokens.first(where: { $0.id == editingID }) {
+                name = token.label
+                scopes = Set(token.scopes)
+                workspaceIDs = Set(token.workspaceIDs ?? [])
+                days = token.expiresAt == nil ? 0 : 30
+            } else { workspaceIDs = [model.registry.activeID]; name = client?.title ?? "" }
+            focused = editingID == nil
+        }
     }
 
     private func permission(_ scope: APIToken.Scope) -> some View {
@@ -192,6 +259,34 @@ private struct TokenPermissionForm: View {
         }
         .toggleStyle(.checkbox)
         .disabled(scope == .searchMeta && scopes.contains(.searchText))
+    }
+}
+
+@MainActor
+private struct ConnectionReceiptView: View {
+    @ObservedObject var model: ManagementModel
+    var body: some View {
+        SheetLayout(model: model, title: "连接配置已准备好",
+                    detail: "令牌由 Clipa 单独保管。客户端配置只包含连接编号；撤销授权后连接立即失效。") {
+            VStack(alignment: .leading, spacing: 14) {
+                if let path = model.connectionResult?.destination {
+                    Label("配置已写入", systemImage: "checkmark.circle")
+                    Text(path.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Text("请重新启动该 AI 客户端，然后让它调用 clipa_status。设置列表中的“最近调用”会在实际访问后更新。")
+                        .font(.callout)
+                } else {
+                    Text("复制以下配置到支持 stdio MCP 的客户端，然后重新启动客户端。")
+                        .font(.callout)
+                }
+                if let backup = model.connectionResult?.backup {
+                    Text("原配置备份：" + backup.path).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Button("复制连接配置") { model.copyConnectionConfig() }
+                if let feedback = model.copyFeedback { Text(feedback).font(.caption).foregroundStyle(.secondary) }
+            }
+        } actions: {
+            Button("完成") { model.dismissSheet() }.buttonStyle(.borderedProminent).keyboardShortcut(.defaultAction)
+        }
     }
 }
 

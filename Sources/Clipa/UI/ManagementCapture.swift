@@ -28,8 +28,16 @@ enum ManagementCapture {
         _ = store.replaceAllForTesting((1...12).map { NewClip(kind: .text, text: "界面演示 \($0)") })
         let tokens = APITokenStore()
         _ = try? tokens.create(label: "Cursor", scopes: [.searchMeta, .searchText],
-                               expiresAt: Date().addingTimeInterval(30 * 86_400))
-        _ = try? tokens.create(label: "本地脚本", scopes: [.searchMeta, .put])
+                               expiresAt: Date().addingTimeInterval(30 * 86_400), workspaceIDs: [registry.activeID], connectionID: UUID())
+        _ = try? tokens.create(label: "本地脚本", scopes: [.searchMeta, .put], workspaceIDs: [registry.activeID])
+        if let db = store.database {
+            _ = try? DatabaseSync.run(db) { db in
+                let collection = try await db.saveCollection(name: "项目参考")
+                let clips = try await db.loadRecentClips(limit: 3)
+                try await db.changeCollectionMembers(id: collection, clips: clips.map(\.id), adding: true)
+                _ = try await db.saveCollection(name: "会议资料")
+            }
+        }
         for index in (0..<6).reversed() {
             APIAuditLog.append(.init(at: Date().addingTimeInterval(Double(-index * 90)), token: index % 2 == 0 ? "Cursor" : "本地脚本",
                                     peer: index % 2 == 0 ? "/Applications/Cursor.app" : "/usr/bin/python3",
@@ -47,6 +55,8 @@ enum ManagementCapture {
             case "rename": model.present(.workspace(registry.activeID))
             case "limit": model.present(.limit)
             case "token": model.present(.token)
+            case "connect": model.present(.connect(.cursor, nil))
+            case "collection": model.present(.collection(nil))
             case "secret":
                 model.present(.token)
                 model.createToken(name: "新程序", scopes: [.searchMeta, .searchText], days: 30)
