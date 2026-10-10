@@ -22,6 +22,8 @@ struct ClipSectionModel: Identifiable, Equatable {
     var title: String { section.title }
 }
 
+/// Sectioning is UI-shaped but UI-independent: the popup never computes date
+/// buckets itself. Recency uses `lastCopiedAt`, matching the store ordering.
 enum ClipGrouper {
     static func group(
         clips: [Clip],
@@ -30,6 +32,13 @@ enum ClipGrouper {
     ) -> [ClipSectionModel] {
         guard !clips.isEmpty else { return [] }
 
+        // One pass, and no `Calendar` call per clip.
+        //
+        // This used to filter the whole array once per section, calling
+        // `bucket(...)` for every clip every time — on a 1000-row result that
+        // is ~3000 Calendar lookups on the main actor, ~50 ms of the typing
+        // stall. The three day boundaries do not depend on the clip, so they
+        // are resolved once here.
         let todayStart = calendar.startOfDay(for: now)
         let yesterdayStart = calendar.date(
             byAdding: .day, value: -1, to: todayStart
@@ -40,7 +49,11 @@ enum ClipGrouper {
         var earlier: [Clip] = []
         for clip in clips {
             let date = clip.lastCopiedAt
-
+            // `date >= todayStart` rather than a window that also checks
+            // `date < tomorrowStart`: a timestamp in the future — a clock that
+            // moved backwards, a row restored from another machine — used to
+            // fall through to 更早 and appear *below* yesterday, even though the
+            // user had just watched it arrive.
             if date >= todayStart {
                 today.append(clip)
             } else if date >= yesterdayStart {
@@ -67,7 +80,8 @@ enum ClipGrouper {
         now: Date = Date()
     ) -> ClipSection {
         if calendar.isDate(date, inSameDayAs: now) { return .today }
-
+        // Kept in step with `group(...)`: a future timestamp is "today", not
+        // "earlier".
         if date > now { return .today }
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
            calendar.isDate(date, inSameDayAs: yesterday) {

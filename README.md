@@ -1,96 +1,70 @@
-# Clipa — Local-first Clipboard Manager for macOS
+# Clipa
 
-Clipa is a native macOS clipboard manager: everything you copy is captured
-into a searchable, **SQLCipher-encrypted** local history and surfaced through
-a floating, Spotlight-style panel (`⌃⌘V`). No account, no cloud, no telemetry —
-data never leaves the machine.
+轻巧的 macOS 剪贴板历史工具。用接近 Spotlight 的紧凑面板，快速找回文本、图片和文件。
 
-## Features
+**[下载最新版](https://github.com/cccc-alt/clipa/releases/latest)** · [更新说明](https://github.com/cccc-alt/clipa/blob/main/CHANGELOG.md) · [界面预览](https://github.com/cccc-alt/clipa/blob/main/docs/images/clipboard.png)
 
-- **Automatic capture** of text / JSON / YAML / Markdown / images / files,
-  with duplicate merging (pausable, per-app ignore list)
-- **Full-text search** over body + notes: Chinese substring matching via
-  FTS5 trigram recall + an in-memory verification engine, plain-literal
-  semantics, fully offline
-- **Source-app badge**: every row shows the originating app's icon
-  (bundle ID captured at copy time)
-- **Private vault**: mark any entry private; body, notes and image bytes are
-  AES-GCM-encrypted at the field level; unlock via Touch ID / password,
-  auto-relock after 60 seconds; private entries never enter the search index
-- **Whole-database encryption**: the history store is a SQLCipher database;
-  the key lives in the device keychain and never leaves this Mac
-- **Notes / aliases** searchable alongside content
-- **Local control plane (MCP)**: AI tools (Claude, Codex, Cursor, …) can
-  search / read / copy / write the history through a token+scope-gated
-  **MCP server** (`clipa-mcp`, stdio) or the `clipa` CLI — with audit
-  logging, rate limiting, and hard exclusion of private entries
-- **Multi-workspace** with independent histories
+当前版本 **2.7.0（Build 20）**。安装包支持 **Apple Silicon / macOS 14+**，在 macOS 26 及更新系统使用原生玻璃材质，支持浅色与深色外观。
 
-## Security model
+## 功能
 
-| Layer | Mechanism |
-|---|---|
-| Database at rest | SQLCipher (AES), per-workspace random key in the device keychain (`ThisDeviceOnly`) |
-| Private entries | Field-level AES-GCM on top of the database encryption |
-| Local API | Token + fine-grained scopes, audit log without content, 60 req/min per token |
-| Private entries via API | Never returned — indistinguishable from a missing id |
+| 功能 | 说明 |
+| --- | --- |
+| 快速找回 | 全文搜索、类型筛选、键盘选择、按需内容预览 |
+| 历史管理 | 文本、图片、文件、收藏、备注与可恢复的会话内备注草稿 |
+| 多工作区 | 独立历史与容量上限，支持创建、切换、重命名及移到废纸篓 |
+| 隐私保护 | SQLCipher 整库加密；私密内容另用 AES-GCM 加密，密钥保存在 macOS 钥匙串 |
+| 私密条目 | Touch ID 或系统密码验证，60 秒自动锁定；不参与搜索和本地接口访问 |
+| 过滤规则 | 忽略指定应用、遵循机密标记、过滤密码管理器及疑似敏感内容 |
+| 本地集成 | CLI / MCP、独立令牌、细分权限、有效期、撤销与调用记录；接口默认关闭 |
+| 新手引导 | 首次启动自动展示，覆盖搜索复制、隐私设置和登录启动 |
 
-The system `sqlite3` CLI cannot open the store (`file is not a database`);
-the key never leaves the keychain. Moving the database file to another Mac
-renders it unreadable by design — use the in-app export/import flow instead.
+## 安装与使用
 
-## Build
+1. 从 [Releases](https://github.com/cccc-alt/clipa/releases/latest) 下载 DMG，将 **Clipa.app** 拖入“应用程序”。
+2. 打开 Clipa，按引导完成设置，或选择“稍后再看”。完成或跳过后不再自动弹出。
+3. 在任意应用复制内容，按 **⌃⌘V** 打开历史，搜索并按回车复制，再到目标应用按 **⌘V** 粘贴。
 
-Requires macOS 14+ (arm64) and Xcode Command Line Tools. SQLCipher 4.6.1
-amalgamation is vendored under `Vendor/SQLCipher` (BSD license) and compiled
-in — no external SQLite dependency.
+顶部菜单只保留“打开剪贴板、登录时启动、设置、关于 Clipa、退出 Clipa”。其他功能在设置中管理；新手引导可从 **设置 → 通用 → 新手引导** 重新查看。
 
-```bash
-Scripts/build.sh          # produces .build/app/Clipa.app and dist/Clipa.dmg
+安装包使用 ad-hoc 签名，尚未通过 Apple 公证。首次打开若被系统阻止，可在核实下载来源后通过“系统设置 → 隐私与安全性”允许打开；钥匙串授权在 macOS 系统弹窗中完成。
 
-.build/app/Clipa.app/Contents/MacOS/Clipa --selftest    # 396 assertions
-Scripts/run_privacy_filter_tests.sh                     # privacy regression suite
+| 快捷键 | 操作 |
+| --- | --- |
+| `⌃⌘V` | 打开 / 关闭剪贴板面板 |
+| `↑` / `↓` | 选择条目 |
+| `↩` | 复制选中条目并关闭面板 |
+| 空格 / `⌘Y` | 查看详情；输入搜索词后使用 `⌘Y` |
+| `Esc` | 返回上一级、取消编辑或关闭面板 |
+| `⌘S` | 保存正在编辑的备注 |
+| `⌘,` | 打开设置 |
+
+## CLI / MCP
+
+在 **设置 → 应用集成** 开启本地接口并创建授权。令牌仅展示一次，可直接复制 Cursor / Codex 配置；请按程序所需选择权限。
+
+- CLI：`/Applications/Clipa.app/Contents/Helpers/clipa`
+- MCP：`/Applications/Clipa.app/Contents/Helpers/clipa-mcp`
+- 客户端通过 `CLIPA_TOKEN` 环境变量提供令牌；不要把真实令牌提交到仓库。
+
+## 从源码构建
+
+需要 Apple Silicon Mac、含 **macOS 26 或更新 SDK** 的 Xcode / Command Line Tools。
+
+```sh
+git clone https://github.com/cccc-alt/clipa.git
+cd clipa
+zsh Scripts/build.sh
 ```
 
-## MCP setup
+脚本会编译随仓库提供的 SQLCipher、构建应用及 CLI / MCP 助手、签名并生成安装包。产物为 `.build/app/Clipa.app` 和 `dist/Clipa-<版本>.dmg`；构建入口以此脚本为准。
 
-1. Menu bar icon → 本地接口 → 开启控制面 → 新建令牌…
-2. Use the built-in "复制 Cursor 配置" / "复制 Codex 配置" buttons in the
-   token dialog (the snippet embeds the token), or configure manually:
+隔离数据与钥匙串的回归检查：
 
-```json
-{
-  "mcpServers": {
-    "clipa": {
-      "command": "/Applications/Clipa.app/Contents/Helpers/clipa-mcp",
-      "env": { "CLIPA_TOKEN": "<your token>" }
-    }
-  }
-}
+```sh
+.build/app/Clipa.app/Contents/MacOS/Clipa --selftest
+.build/app/Clipa.app/Contents/MacOS/Clipa --onboarding-probe
+.build/app/Clipa.app/Contents/MacOS/Clipa --workflow-probe
 ```
 
-The MCP server exposes seven tools: `clipa_status`, `search_clips`,
-`get_clip`, `copy_clip`, `put_clip`, `note_clip`, `delete_clip`.
-
-## Layout
-
-```text
-Sources/Clipa/
-  App/         Entry point, AppDelegate, control-plane server, CLI/MCP
-  Clipboard/   Capture pipeline, pasteboard writer, sensitive detection
-  Models/      Clip model, classifiers
-  Database/    SQLCipher-backed store, migrations, FTS repository
-  Search/      FTS recall, in-memory index, ranking, parity harness
-  UI/          Floating panel (SwiftUI), rows, privacy interactions
-  Settings/    Preferences, login-item self-healing
-  Support/     Store coordination, crypto, tokens, audit
-  Tests/       Self-test suite (396 assertions) and stress tooling
-Vendor/SQLCipher/  Vendored SQLCipher amalgamation (BSD)
-Scripts/           Build, icon generation, privacy test harness
-docs/manual.zh.md  User manual (Chinese)
-```
-
-## License
-
-BSD-2-Clause — see [LICENSE](LICENSE). The vendored SQLCipher amalgamation
-keeps its own BSD license notice in `Vendor/SQLCipher/sqlite3.c`.
+项目采用 [BSD 2-Clause](https://github.com/cccc-alt/clipa/blob/main/LICENSE) 许可；SQLCipher 许可见 [Vendor/SQLCipher/LICENSE.md](https://github.com/cccc-alt/clipa/blob/main/Vendor/SQLCipher/LICENSE.md)。

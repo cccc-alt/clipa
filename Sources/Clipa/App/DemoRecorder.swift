@@ -1,6 +1,9 @@
 import AppKit
 import SwiftUI
 
+/// Drives real bottom-popup states offscreen and records PNG
+/// frame sequences. The output is then encoded by ffmpeg into an operation
+/// demo video.
 enum DemoRecorder {
     private static var attachedWindows: [NSWindow] = []
 
@@ -20,6 +23,8 @@ enum DemoRecorder {
         print("DEMO-FRAMES \(framesRoot)")
         return 0
     }
+
+    // MARK: - Recording helpers
 
     @MainActor
     private static func recordSmartHistory(root: String) {
@@ -142,12 +147,15 @@ enum DemoRecorder {
         }
     }
 
+    // MARK: - Utilities
+
     @MainActor
     private static func makePanelHosting(
         vm: PanelViewModel
     ) -> NSHostingView<QuickStripView> {
         let hosting = NSHostingView(rootView: QuickStripView(vm: vm))
-
+        // The popup's real size on a 1440pt-wide display, so the recorded
+        // frames show the shipped layout rather than a stretched one.
         hosting.frame = NSRect(
             x: 0,
             y: 0,

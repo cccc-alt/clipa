@@ -1,6 +1,8 @@
 import CommonCrypto
 import Foundation
 
+/// SHA-256 helpers used only for duplicate detection. The hash is a storage
+/// field, never a full-text search field.
 enum ContentHasher {
     static func hash(text: String) -> String? {
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)

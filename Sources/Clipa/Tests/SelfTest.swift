@@ -8,7 +8,8 @@ import SwiftUI
 import ServiceManagement
 
 enum SelfTest {
-
+    /// A small PNG for the capture / image probes. The probes need *bytes* that
+    /// decode, not a picture of anything in particular.
     static func makeProbePNG(width: Int, height: Int) -> Data? {
         guard let rep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -37,6 +38,8 @@ enum SelfTest {
         return rep.representation(using: .png, properties: [:])
     }
 
+    /// Offscreen render of a SwiftUI view, for the probes that check the page
+    /// draws text instead of a blank pane.
     @MainActor
     static func makeProbeImage<V: View>(
         view: V,
@@ -55,6 +58,9 @@ enum SelfTest {
         return rep
     }
 
+    /// Dedicated check for the UI async store variants. Kept separate from
+    /// `--selftest` because those methods are @MainActor and self-test runs
+    /// synchronously on the main thread.
     static func asyncStoreProbe() -> Int32 {
         var failures = 0
         let finished = DispatchSemaphore(value: 0)
@@ -298,6 +304,7 @@ enum SelfTest {
             return result
         }
 
+        /// Isolated ClipStore: no real UserDefaults access.
         func makeStore(_ dir: URL) -> ClipStore {
             let suite = "ClipaStoreTest-\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
@@ -328,6 +335,9 @@ enum SelfTest {
                     && settings.autoPausedByLimit == false
             )
 
+            // A pause the user asked for must survive a relaunch. Rebuilding
+            // the auto-pause flag from `autoPauseAtLimit && pauseRecording`
+            // used to resume recording behind the user's back.
             let manualSuite = "ClipaManualPauseTest-\(UUID().uuidString)"
             let manualDefaults = UserDefaults(suiteName: manualSuite)!
             manualDefaults.set(true, forKey: "autoPauseAtLimit")
@@ -361,6 +371,10 @@ enum SelfTest {
             defaults.removePersistentDomain(forName: suite)
         }
 
+        // 2. Content classification. The 2026-09-11 taxonomy keeps only
+        // text / JSON / YAML / Markdown / image / file, so every text-like
+        // capture carries the coarse `.text` kind and the format lives on the
+        // smart tag.
         func tag(_ text: String) -> SmartTag {
             SmartClassifier.inferredTag(text: text, kind: .text)
         }
@@ -482,6 +496,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 8a-2. The summary bar reports what the list is actually showing.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -545,6 +560,10 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+
+        // 2b. Copying must publish a *pasteable* payload, not just a successful
+        // write: the file branch used to write only a file URL, so a text
+        // target had nothing to paste.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -634,6 +653,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 3. Clipboard capture (uses an isolated pasteboard, does not touch user clipboard)
         do {
             let pb = NSPasteboard(name: NSPasteboard.Name("ClipaTest-\(UUID().uuidString)"))
             pb.clearContents()
@@ -646,6 +666,11 @@ enum SelfTest {
             )
         }
 
+        // 3b. Confidential pasteboard markers. The source app states that its
+        // own copy must not be recorded (`org.nspasteboard.ConcealedType` /
+        // `TransientType`). That has to hold for an app nobody put on an ignore
+        // list and for any content kind — including a bare secret the
+        // sensitivity rules cannot recognise as one.
         do {
             let suite = "ClipaConfidentialMarkerTest-\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
@@ -673,7 +698,8 @@ enum SelfTest {
                 pb.clearContents()
                 pb.setString(text, forType: .string)
                 if let marker {
-
+                    // The marker is published as its own flavor, next to the
+                    // payload the user would actually paste.
                     pb.setData(
                         Data(marker.utf8),
                         forType: NSPasteboard.PasteboardType(marker)
@@ -724,6 +750,8 @@ enum SelfTest {
                 detail: String(describing: transient)
             )
 
+            // The gate reads the type list, so it must hold for every content
+            // kind, not only text.
             let sealedImage = NSPasteboard(
                 name: NSPasteboard.Name(
                     "ClipaConfidentialImage-\(UUID().uuidString)"
@@ -749,6 +777,8 @@ enum SelfTest {
                 detail: String(describing: imageDecision)
             )
 
+            // A pasteboard that carries the marker and nothing else must be
+            // skipped rather than recorded as an empty clip.
             let markerOnly = NSPasteboard(
                 name: NSPasteboard.Name(
                     "ClipaConfidentialEmpty-\(UUID().uuidString)"
@@ -768,6 +798,8 @@ enum SelfTest {
                 detail: String(describing: emptyDecision)
             )
 
+            // The marker must not degrade into "drop everything from this
+            // app": the same unknown source without the marker still records.
             let plain = decide(markedPasteboard("普通的一段文本", marker: nil))
             if case .captured(let item) = plain {
                 check(
@@ -782,6 +814,7 @@ enum SelfTest {
                 )
             }
 
+            // Opting out has to restore the old behaviour exactly.
             settings.skipConfidentialPasteboard = false
             let optedOut = decide(
                 markedPasteboard(
@@ -844,7 +877,9 @@ enum SelfTest {
                     capture.map(ClipboardProcessor.resolvedText(from:))
                         == "Clipa 复杂 RTF 内容"
                 )
-
+                // macOS normally satisfies `string(forType:)` by converting RTF
+                // itself, so RTF needs no rich decode and — unlike HTML — never
+                // becomes an import that could fetch something.
                 check(
                     "Rich RTF pasteboard never queues an HTML import",
                     capture?.htmlData == nil,
@@ -897,6 +932,10 @@ enum SelfTest {
             }
         }
 
+        // Clipboard HTML has to stay on this machine. Foundation's HTML
+        // importer resolves remote subresources, so copying a web page used to
+        // make Clipa open connections the moment the pasteboard changed
+        // (measured: 4 connections for one image before the sanitizer).
         do {
             if let probe = LoopbackConnectionProbe() {
                 probe.start()
@@ -914,6 +953,9 @@ enum SelfTest {
                     </body></html>
                     """
 
+                // The load-bearing assertion: the bytes handed to the importer
+                // carry no URL at all, so this holds regardless of how the
+                // platform's loader happens to behave today.
                 let sanitized = RichTextDecoder.sanitizedHTML(html)
                 check(
                     "HTML sanitizer removes every remote reference",
@@ -964,7 +1006,7 @@ enum SelfTest {
                         sourceName: "Safari",
                         policy: CapturePolicySnapshot(settings: settings)
                     )
-
+                    // Give a fetch started during the import time to land.
                     Thread.sleep(forTimeInterval: 1.5)
                     check(
                         "Clipboard HTML opens no connection",
@@ -993,6 +1035,9 @@ enum SelfTest {
                     )
                 }
 
+                // Positive control, run last so its own connections cannot be
+                // mistaken for the import's: the probe does see a real
+                // connection, which is what makes the check above meaningful.
                 let control = URL(
                     string: "http://127.0.0.1:\(probe.port)/control"
                 )!
@@ -1040,7 +1085,8 @@ enum SelfTest {
         }
 
         do {
-
+            // TIFF should stay raw after pasteboard inspection; PNG conversion
+            // is the background-half's job so the main thread stays light.
             let pb = NSPasteboard(name: NSPasteboard.Name("ClipaTIFFTest-\(UUID().uuidString)"))
             pb.clearContents()
             let png = Data(
@@ -1102,7 +1148,8 @@ enum SelfTest {
         }
 
         do {
-
+            // Finder copies a single image file only as a file URL (no PNG
+            // bytes). It must still become a Clipa-owned image clip.
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
                     "ClipaImageFileCaptureTest-\(UUID().uuidString)",
@@ -1125,7 +1172,8 @@ enum SelfTest {
             )
             pb.clearContents()
             pb.writeObjects([sourceURL as NSURL])
-
+            // Finder also puts the file's icon on the pasteboard as TIFF
+            // (rendered at 1024×1024). It must never win over the file.
             let iconRep = NSBitmapImageRep(
                 bitmapDataPlanes: nil,
                 pixelsWide: 16,
@@ -1183,6 +1231,9 @@ enum SelfTest {
                 }
             }
 
+            // A .png file whose bytes are not a real image is still stored
+            // byte-for-byte; Clipa no longer sniffs or decodes at capture
+            // time, so the copy is never silently dropped or rewritten.
             let badURL = root.appendingPathComponent("broken.png")
             try? Data("not-an-image".utf8).write(to: badURL)
             let badPB = NSPasteboard(
@@ -1217,6 +1268,9 @@ enum SelfTest {
                 )
             }
 
+            // Finder also attaches the icon (icns + TIFF) and the file name
+            // as text to every file copy. A copied `Package.swift` must stay
+            // a file clip, not become a 1024×1024 icon image.
             let swiftURL = root.appendingPathComponent("Package.swift")
             try? Data("// swift-tools-version: 5.9".utf8).write(to: swiftURL)
             let filePB = NSPasteboard(
@@ -1279,6 +1333,8 @@ enum SelfTest {
                 )
             }
 
+            // A Finder image whose file disappeared must become a file clip.
+            // Falling back to the pasteboard would store that file's icon.
             let goneURL = root.appendingPathComponent("gone.png")
             let gonePB = NSPasteboard(
                 name: NSPasteboard.Name(
@@ -1330,6 +1386,8 @@ enum SelfTest {
                 )
             }
 
+            // An image file over the storage cap is rejected before it is
+            // read, so a huge file never reaches memory.
             let bigURL = root.appendingPathComponent("big.png")
             FileManager.default.createFile(
                 atPath: bigURL.path,
@@ -1376,6 +1434,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: root)
         }
 
+        // 4. Store: dedupe + pin + note + persistence
         do {
             func newClip(
                 _ text: String,
@@ -1444,6 +1503,8 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 2026-10-04：来源应用 bundleID 随捕获落库（clips.source_bundle），
+        // 重载后 round-trip——徽标图标解析优先走它，名字索引只是旧数据回退。
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -1474,6 +1535,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 2026-10-05：MCP 客户端接入配置生成器（新建令牌弹窗的一键复制）。
         do {
             let token = "clipa_test_token_123"
             let helper = "/Applications/Clipa.app/Contents/Helpers/clipa-mcp"
@@ -1497,6 +1559,10 @@ enum SelfTest {
             )
         }
 
+        // 2026-10-04 整库加密（SQLCipher）：三道验收——
+        // ① codec 真的在（cipher_version 有值）；② 新建的库文件头**不是**
+        //    明文 SQLite 魔数（系统 sqlite3 必须打不开）；
+        // ③ 明文旧库首次打开自动迁移：数据完好、原文件加密、没有明文备份。
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -1532,7 +1598,7 @@ enum SelfTest {
         }
 
         do {
-
+            // 明文旧库 → 首次打开自动迁移。
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
                     "ClipaCipherMigrationTest-\(UUID().uuidString)",
@@ -1542,7 +1608,7 @@ enum SelfTest {
                 at: dir, withIntermediateDirectories: true
             )
             let dbPath = dir.appendingPathComponent("clips.sqlite").path
-
+            // 用系统 SQLite 造一个"旧世界"的明文库（带一张 clips 表 + 一行）。
             var raw: OpaquePointer?
             let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE
                 | SQLITE_OPEN_FULLMUTEX
@@ -1552,7 +1618,8 @@ enum SelfTest {
                 check("Legacy plaintext db opens for fixture", false)
                 return Int32(failures)
             }
-
+            // 明文库 = 当前完整 schema（本测试只验证"明文文件 → 打开时加密"，
+            // 不测 schema 演进——那条由 v1/v2 迁移测试覆盖）。
             sqlite3_exec(raw, DatabaseSchema.clipsTable, nil, nil, nil)
             sqlite3_exec(
                 raw,
@@ -1570,7 +1637,7 @@ enum SelfTest {
                     probe,
                     "SELECT count(*) FROM clips", nil, nil, nil
                 )
-
+                // 简单计数：用 prepare 取回
                 var stmt: OpaquePointer?
                 if sqlite3_prepare_v2(
                     probe, "SELECT count(*) FROM clips", -1, &stmt, nil
@@ -1602,13 +1669,14 @@ enum SelfTest {
             )
             check(
                 "Legacy plaintext db migrates to encrypted at open",
-                rowReadable && headerEncrypted && backupPresent,
+                rowReadable && headerEncrypted && !backupPresent,
                 detail: "row=\(rowReadable) header=\(headerEncrypted)"
                     + " backup=\(backupPresent)"
             )
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4a. SQLite / FTS5 store
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaSQLiteTest-\(UUID().uuidString)", isDirectory: true)
@@ -1771,6 +1839,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
             try? FileManager.default.removeItem(at: migrationDir)
 
+            // v1 clips.sqlite (position schema + source_app/id FTS) -> v2.
             let v1Dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaV1MigrationTest-\(UUID().uuidString)", isDirectory: true)
             try? FileManager.default.createDirectory(
@@ -1854,6 +1923,7 @@ enum SelfTest {
             )
             try? FileManager.default.removeItem(at: v1Dir)
 
+            // v2 (Clipa 2.0.0) database without ai_visibility -> v3.
             let v2Dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaV2toV3Test-\(UUID().uuidString)", isDirectory: true)
             try? FileManager.default.createDirectory(
@@ -1918,6 +1988,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: v2Dir)
         }
 
+        // v3 (TEXT kind + INTEGER timestamps) -> v4 (INTEGER kind + REAL time).
         do {
             let v3Dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaV3toV4Test-\(UUID().uuidString)", isDirectory: true)
@@ -1993,6 +2064,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: v3Dir)
         }
 
+        // 4d-3. The short-content filter is gone: a one-character copy is kept.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -2040,6 +2112,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4e. History limit: trimming, auto-pause, and the pure shrink count.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaLimitTest-\(UUID().uuidString)", isDirectory: true)
@@ -2094,6 +2167,7 @@ enum SelfTest {
                     && store.items.count == 3
             )
 
+            // Making room ends the automatic pause without a relaunch.
             if let victim = store.items.first(where: { $0.text == "limit-0" }) {
                 _ = store.delete(victim)
             }
@@ -2107,6 +2181,8 @@ enum SelfTest {
             store.settings.autoPauseAtLimit = false
             store.settings.pauseRecording = false
 
+            // Lowering the limit applies immediately instead of waiting for the
+            // next capture to trim a large batch.
             check(
                 "Limit shrink asks only when rows would be deleted",
                 SettingsStore.historyLimitDeletionCount(
@@ -2134,7 +2210,8 @@ enum SelfTest {
                         requested: 500,
                         rowCount: 445
                     ) == nil
-
+                    // "无限制" (0) has no numeric bound: switching to a finite
+                    // limit deletes the overflow, so it must ask too.
                     && SettingsStore.historyLimitDeletionCount(
                         current: 0,
                         requested: 2_000,
@@ -2152,6 +2229,11 @@ enum SelfTest {
                     ) == nil
             )
 
+            // 开机自启的自愈决策（2026-10-01）：本应用是 ad-hoc 签名，每次重装的
+            // CDHash 都不同，旧登记会指向旧代码、登录时静默失败（症状就是
+            // "菜单显示已开启、系统记录 enabled，却从不启动"）。决策矩阵必须能
+            // 区分"重装失效"（自动修）与"用户在系统设置里关了"（别抢）——
+            // 依据是登记时记录的 bundle 指纹有没有变。
             do {
                 func decide(
                     _ status: SMAppService.Status,
@@ -2194,7 +2276,7 @@ enum SelfTest {
                         identityMatches: false
                     ) == .none
                 )
-
+                // 指纹本身要可读且稳定：两次一致、长度是 SHA-256 的 64 个十六进制位。
                 let identityA = SettingsStore.currentBuildIdentity()
                 let identityB = SettingsStore.currentBuildIdentity()
                 check(
@@ -2205,6 +2287,9 @@ enum SelfTest {
                 )
             }
 
+            // search 的裸词全部拼进查询（2026-10-02）：`search 1 limit 50` 少了
+            // 横杠时，"limit" "50" 是搜索词而不是参数 —— 解析不猜用户意图
+            //（CLI 侧会为此打 stderr 提示，但行为本身钉在这里）。
             if let parsed = APIClientCLI.Options(
                 arguments: ["search", "1", "limit", "50"]
             ) {
@@ -2216,6 +2301,9 @@ enum SelfTest {
                 check("search 的裸词全部拼进查询", false)
             }
 
+            // 搜索排序切换（2026-10-02）：「相关」= 打分序（正文全等 > 前缀），
+            // 「最新」= lastCopiedAt 序（位置稳定）。造两条让两种排序顺序相反的
+            // 条目，断言 vm 的开关真的改变了结果顺序。
             do {
                 let dir = FileManager.default.temporaryDirectory
                     .appendingPathComponent(
@@ -2308,6 +2396,10 @@ enum SelfTest {
                     && store.items.contains { $0.text == newestText }
             )
 
+            // The panel groups by recency and `trimToLimit` treats the tail as
+            // the oldest rows, so `items` must stay ordered by
+            // (lastCopiedAt DESC, dbID DESC) after every kind of edit — not
+            // only after a full reload.
             let recencyOrdered: ([Clip]) -> Bool = { clips in
                 zip(clips, clips.dropFirst()).allSatisfy { lhs, rhs in
                     lhs.lastCopiedAt != rhs.lastCopiedAt
@@ -2341,6 +2433,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4g. Unified asset availability for image and file clips.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipAssetAvailabilityTest-\(UUID().uuidString)", isDirectory: true)
@@ -2417,6 +2510,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4h. A recaptured image repairs a row whose stored bytes went missing.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipImageAdoptionTest-\(UUID().uuidString)", isDirectory: true)
@@ -2435,7 +2529,7 @@ enum SelfTest {
             )
             if let existing = store.items.first,
                let database = store.database {
-
+                // Simulate a row whose bytes were lost (legacy/corrupt row).
                 _ = try? DatabaseSync.run(database) { db in
                     try await db.updateImage(
                         dbID: existing.dbID,
@@ -2466,6 +2560,9 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4h-2. v10 image storage: bytes live in `clip_images`, the inline
+        // column stays empty (that is what keeps `clips` scans cheap), the
+        // one-time move rescues older rows, and deletes take the bytes along.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -2505,6 +2602,9 @@ enum SelfTest {
                         && store.hasImageData(for: storedItem)
                 )
 
+                // An older row still carrying its bytes inline must survive
+                // the move: readable afterwards, inline column cleared,
+                // nothing left pending.
                 let legacyBytes = Data((0..<1_024).map { UInt8($0 % 97) })
                 var legacyID: Int64 = 0
                 if let conn = try? DatabaseConnection(path: databaseURL.path) {
@@ -2571,6 +2671,12 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4h-3. A change to the normalization rule must recompute the existing
+        // rows, not just re-stamp the marker. Before this was locked down the
+        // marker was a hand-written version number, so bumping it alone made
+        // the SQL fast path trust columns that still held the old rule's text.
+        // P1 修复回归（2026-10-02）：零宽字符与 BOM 从索引与查询**两侧**剥离，
+        // NBSP 折成普通空格——网页复制的隐形字符不得让搜索静默失配。
         check(
             "零宽字符与 BOM 归一化后消失",
             QueryNormalizer.normalize("cl\u{200B}i\u{200C}ck\u{200D}")
@@ -2602,7 +2708,8 @@ enum SelfTest {
             var staleValue: String?
             if let conn = try? DatabaseConnection(path: databaseURL.path) {
                 try? conn.configure()
-
+                // Pretend an older rule wrote these columns, then stamp the
+                // marker as that older build would have.
                 try? conn.exec("""
                     UPDATE clips
                     SET norm_text = 'stale-value', norm_note = 'stale-value'
@@ -2647,6 +2754,8 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4h-4. Workspaces: one database per workspace, with the default one
+        // staying on the legacy top-level path so existing data never moves.
         do {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -2687,6 +2796,8 @@ enum SelfTest {
                         )
                 )
 
+                // Isolation: a clip saved in one workspace must not appear in
+                // another.
                 if let second, let third {
                     let storeA = ClipStore(
                         baseDirectory: registry.baseDirectory(for: second)
@@ -2733,6 +2844,9 @@ enum SelfTest {
                     !reloaded.workspaces.contains { $0.id == third?.id }
                 )
 
+                // History limit: per workspace, stored with the workspace so
+                // a backup carries it, with the default one left on the
+                // historical global key.
                 registry.setHistoryLimit(2000, for: second!.id)
                 let reloadedLimits = WorkspaceStore(rootDirectory: root)
                 check(
@@ -2756,6 +2870,7 @@ enum SelfTest {
                     withLimit?.historyLimit == 300
                 )
 
+                // Which scope the live limit is written to.
                 let scopeSuite = "ClipaHistoryLimitScope-\(UUID().uuidString)"
                 let scopeDefaults = UserDefaults(suiteName: scopeSuite)!
                 scopeDefaults.set(500, forKey: "historyLimit")
@@ -2799,6 +2914,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: root)
         }
 
+        // 4i. Auto-paused image captures are dropped without side effects.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipImageOrphanTest-\(UUID().uuidString)", isDirectory: true)
@@ -2833,6 +2949,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4i-2. Schema v6 image files migrate into BLOBs (v6 → v7).
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -2881,7 +2998,7 @@ enum SelfTest {
                     )
                     """)
                 try conn.exec(DatabaseSchema.ftsTable)
-
+                // The AI feature's usage table, as an older build left it.
                 try conn.exec("""
                     CREATE TABLE ai_token_usage (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2910,7 +3027,8 @@ enum SelfTest {
 
             let migratedStore = makeStore(dir)
             let pendingClip = migratedStore.items.first { $0.kind == .image }
-
+            // Opening the database must not read legacy image files; the
+            // import is drained by a background pass after launch.
             let deferred = pendingClip != nil
                 && pendingClip.flatMap { migratedStore.imageData(for: $0) } == nil
                 && FileManager.default.fileExists(atPath: imagesDir.path)
@@ -2931,7 +3049,8 @@ enum SelfTest {
                     && retired
                     && !FileManager.default.fileExists(atPath: imagesDir.path)
             )
-
+            // What the removed AI feature left in the schema must not survive
+            // an upgrade.
             let legacyAISchemaDropped: Bool = {
                 guard let conn = try? DatabaseConnection(path: dbPath) else {
                     return false
@@ -2949,6 +3068,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4j. Legacy duplicate content hashes collapse before unique index.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipHashUniqueIndexTest-\(UUID().uuidString)", isDirectory: true)
@@ -2996,6 +3116,12 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4j-2. The duplicate key is (content_hash, kind), not the hash alone.
+        // A text copy of a path and the Finder copy of that same file hash
+        // identically on purpose, and the second one has to survive as its own
+        // entry instead of being folded into the first — which is what the
+        // hash-only key did, so the user's copy produced no new card and the
+        // file card silently came back to the top.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -3040,6 +3166,11 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4j-3. The legacy `clips.json` import is retryable. It used to run
+        // only while the `clips` table was being created, so a single failure
+        // (a crash, a force quit) left that table behind and every later launch
+        // took the "already migrated" path: the file was never looked at again
+        // and the pre-upgrade history stayed on disk, silently ignored.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -3051,7 +3182,8 @@ enum SelfTest {
                 withIntermediateDirectories: true
             )
             let jsonURL = dir.appendingPathComponent("clips.json")
-
+            // First launch: the file exists but cannot be decoded, so nothing
+            // is imported — and, crucially, nothing is marked as done either.
             try? Data("{ not json".utf8).write(to: jsonURL)
             var firstLaunch: ClipStore? = makeStore(dir)
             check(
@@ -3059,7 +3191,8 @@ enum SelfTest {
                 firstLaunch?.items.isEmpty == true
             )
             firstLaunch = nil
-
+            // Second launch: the database now exists (with an empty `clips`
+            // table). The import has to be attempted again.
             let legacyObject: [String: Any] = [
                 "id": UUID().uuidString,
                 "kind": "text",
@@ -3085,7 +3218,8 @@ enum SelfTest {
                     && secondLaunch?.items.first?.text == "rescued legacy item",
                 detail: "rows=\(secondLaunch?.items.count ?? -1)"
             )
-
+            // And it must not run again once it has succeeded — not even after
+            // the user deletes every clip.
             secondLaunch?.clearAll()
             secondLaunch = nil
             let thirdLaunch = makeStore(dir)
@@ -3097,6 +3231,9 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4j-4. Text containing U+0000 survives the round trip. SQLite binds and
+        // returns text by byte length; reading it back with `String(cString:)`
+        // stopped at the NUL, so the clip came back shorter than it was copied.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -3122,6 +3259,9 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4j-5. The tables the removed AI search features left behind are
+        // dropped on the upgrade that follows, and the *live* search marker in
+        // the same table is deliberately left alone.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -3186,6 +3326,9 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4k. An unusable store must never look like a healthy empty history:
+        // it has to report itself, keep refusing writes, and leave the
+        // damaged file exactly where the user can still recover it.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -3198,6 +3341,7 @@ enum SelfTest {
             )
             let databaseURL = DatabaseManager.databaseURL(in: dir)
 
+            // A fresh install with no file yet is healthy, not broken.
             let freshStore = makeStore(dir)
             check(
                 "Fresh install reports a ready store",
@@ -3206,6 +3350,7 @@ enum SelfTest {
             )
             try? FileManager.default.removeItem(at: dir)
 
+            // Same directory, now holding a file that is not a database.
             try? FileManager.default.createDirectory(
                 at: dir,
                 withIntermediateDirectories: true
@@ -3228,6 +3373,8 @@ enum SelfTest {
                 (try? Data(contentsOf: databaseURL)) == garbage
             )
 
+            // Writes are refused, and the freshly written image of a refused
+            // capture does not linger on disk.
             var rejectionNotices = 0
             let observer = NotificationCenter.default.addObserver(
                 forName: ClipStore.captureRejectedNotification,
@@ -3262,6 +3409,8 @@ enum SelfTest {
             )
             NotificationCenter.default.removeObserver(observer)
 
+            // Retry only succeeds once the path is usable again; a store that
+            // cannot be repaired must stay in the failure state.
             check(
                 "Retry on a still-broken file stays unavailable",
                 !brokenStore.retryDatabaseOpen()
@@ -3295,6 +3444,8 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // A path that cannot hold a database is reported as a storage fault,
+        // not as a damaged file.
         do {
             let store = makeStore(
                 URL(fileURLWithPath: "/dev/null/ClipaStoreFailure")
@@ -3306,6 +3457,7 @@ enum SelfTest {
             )
         }
 
+        // 4d. v2 search modules: parser / builder / hybrid / ranking / grouping
         do {
             let parser = SearchQuery.parse("docker network")
             check(
@@ -3444,6 +3596,10 @@ enum SelfTest {
                 updatedNoteResult.clips.first?.text == "更新备注测试正文"
             )
 
+            // Whitespace-separated words are AND-ed, so they do not have to be
+            // adjacent and their order does not matter — the box used to be
+            // matched as one literal phrase, which made `network docker` miss a
+            // clip that plainly contains both words.
             let reordered = engine.search(
                 query: "network docker",
                 filter: SearchFilter(),
@@ -3456,6 +3612,9 @@ enum SelfTest {
                 detail: reordered.clips.map(\.text).joined(separator: " | ")
             )
 
+            // Normalization folds width and accents, so the search copies do
+            // not depend on how the text was typed: a Chinese IME's full-width
+            // `ＡＢＣ` is findable as `abc`, and `café` as `cafe`.
             hybridStore.insert(draft("ＡＢＣ 全角文本"))
             hybridStore.insert(draft("café latte"))
             let fullWidth = engine.search(
@@ -3677,6 +3836,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: duplicateDir)
         }
 
+        // 4c. Private clips
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaPrivateTest-\(UUID().uuidString)", isDirectory: true)
@@ -3695,6 +3855,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4b. Smart tags, search facets, transforms & snippets
         do {
             var nextDBID: Int64 = 0
             func item(
@@ -3798,7 +3959,8 @@ enum SelfTest {
                 "Sensitive detection ignores placeholder token",
                 !item("token: example-token-123456").isSensitiveContent
             )
-
+            // Shape matching must read structured payloads too, without the
+            // sensitive rules depending on the content classification.
             check(
                 "Sensitive detection reads quoted credential keys",
                 item(#"{"password": "hunter2hunter2"}"#)
@@ -3819,7 +3981,9 @@ enum SelfTest {
                     && !item(#"{"password": null}"#).isSensitiveContent
                     && !item(#"{"password": "abc"}"#).isSensitiveContent
             )
-
+            // P0: a value that only *points at* a credential is not one. The
+            // rule has to be whole-value anchored, or the crypt hashes below
+            // (which start with `$`) would be swallowed with the references.
             let referenceForms = [
                 #"password: ${DB_PASSWORD}"#,
                 #"password: ${DB_PASSWORD:-}"#,
@@ -3867,6 +4031,9 @@ enum SelfTest {
                 )
             )
 
+            // The capture gate and the persisted marker must agree, otherwise
+            // "自动跳过敏感内容" leaks the categories only the extended rules
+            // know about.
             let gateSamples = [
                 "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
                 "postgres://admin:S3cret@db.internal:5432/app",
@@ -3953,6 +4120,8 @@ enum SelfTest {
                     }
                 )
 
+                // 手动标签（setSmartTag）已于 2026-10-02 随右键「智能标签」
+                // 一并移除；这里只保留自动分类的持久化与升级路径。
                 if let database = store.database,
                    let target = store.items.first(
                     where: { $0.text == "git status" }
@@ -3967,7 +4136,9 @@ enum SelfTest {
                         "Reclassification fixture marked stale",
                         downgraded?.classificationVersion == 0
                     )
-
+                    // The in-memory rows still hold the pre-downgrade
+                    // version; reload so the assertion below can only pass
+                    // when the reclassification pass really ran.
                     store.reloadFromDatabase()
                     check(
                         "Stale version is visible after reload",
@@ -3993,7 +4164,10 @@ enum SelfTest {
             }
 
             do {
-
+                // P0 修复回归（2026-10-02）：解密失败的私密行**拒绝取消私密**。
+                // 构造 is_private=1 但密文损坏的行（等价于钥匙串被代换后解不开
+                // 的状态），updatePrivate 必须抛错并保持原样——旧行为是把内存里
+                // 的空串写回数据库，密文被 `text=''` 永久覆盖。
                 let dir = FileManager.default.temporaryDirectory
                     .appendingPathComponent(
                         "ClipPrivateGuardTest-\(UUID().uuidString)",
@@ -4052,7 +4226,7 @@ enum SelfTest {
                         "密文仍在数据库里（没有被空串覆盖）",
                         storedAfter == "clipa1:%%%invalid-envelope%%%"
                     )
-
+                    // 拒绝必须是条件性的：换成合法密文后同一条切换应当成功。
                     let recovered: Bool = awaitAsync {
                         do {
                             let good = try StoreCrypto.sealForStorage("recovered")
@@ -4162,6 +4336,10 @@ enum SelfTest {
             check("Search: negative token",
                   !indexHit(chrome, "image kubernetes"))
 
+            // The production rebuild splits rows across cores; 40k rows makes
+            // it use every worker, and the result must match a serial build
+            // exactly — including the ambiguity flags that decide which rows
+            // the SQL fast path is allowed to settle.
             do {
                 let bulkCount = 40_000
                 var bulk: [Clip] = []
@@ -4222,6 +4400,10 @@ enum SelfTest {
                 )
             }
 
+            // Deferred index merging: a change that arrives while a snapshot
+            // is alive is queued instead of copying the whole dictionary, and
+            // it must still be visible to the store, to later snapshots, and
+            // to the ambiguity checks that gate the SQL fast path.
             do {
                 let stamp = Date()
                 func indexedClip(_ dbID: Int64, _ text: String) -> Clip {
@@ -4293,6 +4475,8 @@ enum SelfTest {
                         ) == true
                 )
 
+                // Releasing both snapshots lets the next change merge the
+                // queue back into the base dictionaries, in place.
                 earlySnapshot = nil
                 laterSnapshot = nil
                 index.remove(dbID: 1)
@@ -4311,6 +4495,11 @@ enum SelfTest {
                 )
             }
 
+            // The time filter keeps its ±1s storage tolerance (SQLite stores
+            // whole seconds, so a clip captured late in a second can read just
+            // after the boundary) and still refuses an inverted interval. This
+            // is the only metadata time rule: it used to be duplicated — with
+            // different semantics — by `SearchFilter.matches`.
             do {
                 let base = Date()
                 func timeCriteria(_ interval: DateInterval?) -> SearchCriteria {
@@ -4348,9 +4537,16 @@ enum SelfTest {
                         && !window.matches(clip: timeClip(-1.5))
                         && !window.matches(clip: timeClip(61.5))
                 )
-
+                // NOTE: an "inverted" interval (start > end) cannot be built
+                // here — both `DateInterval` initializers trap on this
+                // platform — which is exactly why `SearchCriteria` must never
+                // construct one when two ranges do not overlap.
             }
 
+            // Two ranges that do not overlap must end up as "matches nothing".
+            // `DateInterval` traps when start > end, so the search path
+            // intersects windows instead of intervals — a plan's range against
+            // the UI filter's range used to crash the app here.
             do {
                 let base = Date()
                 func windowedPlan(_ range: DateInterval?) -> SearchQueryPlan {
@@ -4424,6 +4620,9 @@ enum SelfTest {
                 )
             }
 
+            // The panel list is cached and windowed: the view is handed one
+            // page of rows instead of every entry, and a far jump (keyboard
+            // navigation wraps) keeps its target inside the window.
             do {
                 let dir = FileManager.default.temporaryDirectory
                     .appendingPathComponent(
@@ -4469,7 +4668,8 @@ enum SelfTest {
                             $0.id == "clip-\(lastID.uuidString)"
                         } && vm.renderedEntries.count <= page + 1
                     )
-
+                    // A recentred window must not be a one-way door: the rows
+                    // above it stay reachable by scrolling back up.
                     check(
                         "A recentred window can be scrolled back upwards",
                         vm.canExtendRenderedWindowUpward
@@ -4497,8 +4697,11 @@ enum SelfTest {
                 try? FileManager.default.removeItem(at: dir)
             }
 
+
         }
 
+        // FTS5 narrows recall for multi-term queries; each term has to be
+        // quoted, and an OR group has to stay one group.
         check(
             "FTS group query quotes AND/OR",
             FTSQueryBuilder.buildGroupQuery(
@@ -4509,6 +4712,7 @@ enum SelfTest {
                 ) == "(\"terway\" OR \"cilium\")"
         )
 
+        // 7. Clipboard writer copy round trip (isolated clipboard only)
         do {
             let item = Clip(
                 dbID: 1,
@@ -4627,7 +4831,8 @@ enum SelfTest {
                 )
             )
             if let item = store.items.first {
-
+                // Simulate a row whose bytes are gone (legacy/corrupt row) so
+                // the unavailable-asset path is exercised.
                 if let database = store.database {
                     _ = try? DatabaseSync.run(database) { db in
                         try await db.updateImage(
@@ -4688,6 +4893,8 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 8. Arrow navigation uses a stable flat order and never re-flattens
+        // results per key press. Rapid wrap-around must stay consistent.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipaNavigationTest-\(UUID().uuidString)", isDirectory: true)
@@ -4707,7 +4914,9 @@ enum SelfTest {
                     store: store,
                     settings: store.settings
                 )
-
+                // The panel paints its first frame off the main actor now;
+                // these assertions need the result in hand, so they use the
+                // synchronous entry point.
                 vm.refreshSearch()
                 check(
                     "Navigation has flat row order",
@@ -4741,6 +4950,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 8a. A re-query keeps the selection inside the visible list.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("ClipSelectionReconcileTest-\(UUID().uuidString)", isDirectory: true)
@@ -4771,7 +4981,9 @@ enum SelfTest {
                     "Re-query keeps the visible row selected",
                     vm.selectedItem?.id == first.id
                 )
-
+                // Narrowing to a query that no row matches must not leave the
+                // old card selected: the panel would then act on a row that is
+                // no longer on screen.
                 vm.query = "selection-row-none"
                 vm.refreshSearch()
                 check(
@@ -4783,6 +4995,8 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 8a-2. Deleting a card keeps the reader's place: the next card takes
+        // the selection, and the row must *not* scroll to follow it.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -4814,7 +5028,9 @@ enum SelfTest {
                     "Delete keeps place: selecting a card asks the row to follow",
                     vm.revealSelection
                 )
-
+                // Not `awaitAsync`: the delete is main-actor work, and that
+                // helper blocks the main thread while it waits. Start the task
+                // and pump the run loop, the way the other UI-path probes do.
                 Task { @MainActor in await vm.deleteAsync(third) }
                 var deleteDeadline = Date().addingTimeInterval(10)
                 while vm.navigationOrder.count == 5, Date() < deleteDeadline {
@@ -4830,7 +5046,7 @@ enum SelfTest {
                     "Delete keeps place: the row does not scroll after a delete",
                     !vm.revealSelection
                 )
-
+                // Navigating again hands the row back to the reader.
                 vm.moveSelection(by: 1)
                 check(
                     "Delete keeps place: navigating again restores following",
@@ -4840,6 +5056,9 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 8c. Return must copy from the search box as well. The field used to
+        // swallow it (its onSubmit only re-ran the live search), so
+        // "↓ 选中 → 回车" silently copied nothing.
         do {
             let ready = PanelKeyRouter(
                 isTextEditorOpen: false,
@@ -4858,7 +5077,8 @@ enum SelfTest {
                 ready.action(keyCode: 126, modifiers: []) == .moveSelection(-1)
                     && ready.action(keyCode: 125, modifiers: []) == .moveSelection(1)
             )
-
+            // ⌘D is no longer claimed by the panel: it stays with whatever has
+            // focus, and a bare `d` keeps passing through as well.
             check(
                 "Command-D passes through",
                 ready.action(keyCode: 2, modifiers: [.command]) == .passThrough
@@ -4885,6 +5105,7 @@ enum SelfTest {
                 ready.action(keyCode: 0, modifiers: []) == .passThrough
             )
 
+            // A visible list with no selection leaves Return with no target.
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
                     "ClipSelectionDefaultTest-\(UUID().uuidString)",
@@ -4917,6 +5138,10 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 8d. Ignoring "the current app" must never guess: while Clipa's own
+        // window is frontmost the answer is the last app the user worked in,
+        // and when that is unknown the action refuses instead of adding Clipa
+        // itself to the ignore list.
         do {
             let own = "com.clipa.desktop"
             let xcode = IgnoreTargetResolver.Candidate(
@@ -4993,6 +5218,8 @@ enum SelfTest {
             )
         }
 
+        // 8e. The capture path evaluates every app that was frontmost inside
+        // the poll window, and one ignored app among them drops the capture.
         do {
             let suite = "ClipaIgnorePolicy-\(UUID().uuidString)"
             let defaults = UserDefaults(suiteName: suite)!
@@ -5035,7 +5262,10 @@ enum SelfTest {
                         ? !policy.isOwnApp(bundleID: nil)
                         : policy.isOwnApp(bundleID: policy.ownBundleID))
             )
-
+            // An external copy made while the panel holds focus (Clipa is the
+            // frontmost app) must still be recorded: only Clipa's own pasteboard
+            // write is skipped, and that is decided by the monitor's suppression
+            // marker, not by "who is frontmost".
             let scratch = NSPasteboard(
                 name: NSPasteboard.Name("clipa-own-app-check")
             )
@@ -5062,7 +5292,7 @@ enum SelfTest {
                 ownCaptured == "own-app-attribution-probe",
                 detail: ownCaptured ?? "\(ownDecision)"
             )
-
+            // …and the attribution prefers the last app the user was in.
             let segment = ActiveAppTracker.FrontmostSegment(
                 bundleID: "com.clipa.desktop",
                 name: "Clipa",
@@ -5076,7 +5306,7 @@ enum SelfTest {
                     lastExternalName: "终端"
                 ) == (name: "终端", bundleID: nil)
             )
-
+            // bundleID 与名字一起归因（2026-10-04 落库 source_bundle）。
             check(
                 "Attribution carries the external app's bundle ID",
                 ClipboardMonitor.captureSource(
@@ -5093,6 +5323,8 @@ enum SelfTest {
                 ) == (name: "Safari", bundleID: "com.apple.Safari")
             )
 
+            // Timeline math: the app already frontmost when the window opens
+            // stays a candidate, because the copy may predate the switch.
             let tracker = ActiveAppTracker.shared
             let base = Date()
             tracker.record(bundleID: "com.example.secret", name: "Secret", at: base)
@@ -5125,6 +5357,9 @@ enum SelfTest {
             )
         }
 
+        // 8f. Ignore entries are normalized before they are stored or compared,
+        // the password-manager rules are visible, and an app picked by hand is
+        // added through the same path as the frontmost app.
         do {
             check(
                 "Bundle ids are trimmed and lowercased",
@@ -5197,6 +5432,8 @@ enum SelfTest {
                         .contains("com.1password.1password")
             )
 
+            // The picker path: a real app bundle is added normalized, a file
+            // that is not an app is reported instead of added silently.
             let addSuite = "ClipaIgnoreAdd-\(UUID().uuidString)"
             let addSettings = SettingsStore(
                 defaults: UserDefaults(suiteName: addSuite)!
@@ -5227,7 +5464,8 @@ enum SelfTest {
                     batch.added.isEmpty && batch.unusable.count == 1,
                     detail: String(describing: batch)
                 )
-
+            // 忽略与跳过 renders one line from a pure value, so the wording and
+            // the enabled state are pinned here rather than in the menu.
             let storable = IgnoreTargetPresentation.make(
                 resolution: .resolved(
                     bundleID: "com.apple.Safari",
@@ -5284,7 +5522,10 @@ enum SelfTest {
                     && AppIdentityCache.shared
                         .identity(for: "com.example.missing") == nil
             )
-
+            // Removing an entry must replace the old status line, and must not
+            // claim success when the app is still ignored by the toggle.
+            // (The wording moved out of the settings window when that window
+            // was removed; the rule it encodes is what is pinned here.)
             let removed = IgnoreListNotice.removal(
                 name: "百度网盘",
                 stillAutoIgnored: false
@@ -5313,6 +5554,11 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: notAnApp)
         }
 
+        // 11. Ordinary local search treats the whole query as one keyword;
+        // AI-enhanced and learned plans keep their own semantics.
+
+        // 12. History clear hardening: stale capture generations and image
+        // path boundaries must stay safe.
         do {
             var gate = PasteboardCaptureGate()
             let oldEpoch = gate.epoch
@@ -5333,6 +5579,11 @@ enum SelfTest {
             )
         }
 
+        // 「私密」现在是**加密**（M3，2026-09-26）：正文与备注以密文落盘、密钥在
+        // 本机钥匙串。这段话是用户与"相反认知"之间唯一的东西，所以三件事都要被断言，
+        // 而不是留给 review：①加密了什么 ②为什么备份里读不到 ③**搜索行为**。
+        // 少任何一条都得让测试红，而不是发出去。（2026-10-04：图片 seal
+        // 全覆盖后，旧断言里的"暂未加密"已不再属实，改为钉住"含图片"。）
         do {
             check(
                 "Private cover copy states encryption and where the key lives",
@@ -5351,6 +5602,10 @@ enum SelfTest {
             )
         }
 
+        // The bottom popup is the app's only clipboard page, and ⌃⌘V is the
+        // app's only global hotkey: it must be the combination it claims to be,
+        // the window has to stay on screen, and it must be anchored *on* the
+        // bottom edge so it can slide out of that edge.
         do {
             check(
                 "The only global hotkey is ⌃⌘V (never a bare Control-V)",
@@ -5361,6 +5616,15 @@ enum SelfTest {
                 detail: HotkeySpec.panelToggle.name
             )
 
+            // The strip anchors to the display's own frame — so it sits on the
+            // physical bottom edge even when a Dock occupies it — while the
+            // main panel anchors to the usable area below the menu bar. These
+            // two rects mirror a real 1440×900 display with a Dock at the
+            // bottom: screen 0…900, usable area 80…870.
+            // The panel anchors to the display's own frame, centered like the
+            // Spotlight clipboard view (2026-10-04): 水平居中，垂直中心在屏幕
+            // 高度 54% 处（实拍测得自顶 46%）——比几何居中略高，落在视线
+            // 自然停留的位置。
             let screen = NSRect(x: 0, y: 0, width: 1440, height: 900)
             let strip = QuickStripController.panelFrame(in: screen)
             check(
@@ -5383,7 +5647,9 @@ enum SelfTest {
                     ).minY >= 0,
                 detail: "small=\(QuickStripController.panelFrame(in: NSRect(x: 0, y: 0, width: 800, height: 500)))"
             )
-
+            // The slide starts 48pt below the resting frame — a short rise
+            // with the same hand-driven interpolation, no longer a full
+            // screen climb.
             let slideStart = QuickStripController.startFrame(for: strip)
             check(
                 "Panel slides up from 48pt below its resting spot",
@@ -5399,7 +5665,8 @@ enum SelfTest {
                     && QuickStripView.cardPageSize >= 100,
                 detail: "height=\(QuickStripController.preferredHeight)"
             )
-
+            // 列表行几何（2026-10-04 对齐 Spotlight）：行高由缩略图与内边距
+            // 决定，鼠标点击探针据此把点击落在真实的行上。
             let paneWidth = QuickStripController.panelFrame(in: screen).width
             check(
                 "List rows fit the popup without overflowing",
@@ -5412,7 +5679,12 @@ enum SelfTest {
                         > QuickStripView.rowCenterY(index: 1, in: paneWidth),
                 detail: "row=\(QuickStripView.rowHeight) pane=\(paneWidth)"
             )
-
+            // 来源应用徽标（2026-10-04）：sourceApp 记录的是**本地化名字**
+            // （终端 / 备忘录），索引必须能解析到真实应用图标——旧实现只拼
+            // /Applications/名字.app，这两个名字都会 miss（用户实测报告）。
+            // 索引构建已禁止在渲染事务内同步执行（MDQuery × AttributeGraph
+            // 互锁会挂死面板），自检在无渲染事务的 MainActor 上用测试钩子
+            // 同步构建。
             SpotlightRowView.buildAppIndexForTesting()
             check(
                 "Source app icon resolves localized names",
@@ -5421,7 +5693,8 @@ enum SelfTest {
                     && SpotlightRowView.appIcon(forAppName: "Safari") != nil,
                 detail: "终端/备忘录/Safari 图标均解析成功"
             )
-
+            // bundleID 优先解析（2026-10-04 source_bundle 落库）：不依赖名字
+            // 索引，跨系统语言稳定。
             check(
                 "Source app icon resolves via bundle ID",
                 SpotlightRowView.appIcon(bundleID: "com.apple.finder") != nil
@@ -5430,6 +5703,8 @@ enum SelfTest {
                 detail: "Finder/Notes 按 bundleID 解析成功"
             )
 
+            // A display smaller than the surface must shrink it instead of
+            // letting the window hang off the edge.
             let small = NSRect(x: 0, y: 0, width: 600, height: 400)
             let smallStrip = QuickStripController.panelFrame(in: small)
             check(
@@ -5473,6 +5748,11 @@ enum SelfTest {
             )
         }
 
+        // A type filter has to re-run the search by itself. The buttons that
+        // used to do this (the strip's chips, the panel's 类型 menu) are gone —
+        // filtering is now the search box's job — but the state layer still
+        // backs it, and it must never depend on some other view's `onChange`
+        // being alive to take effect.
         do {
             MainActor.assumeIsolated {
                 let dir = FileManager.default.temporaryDirectory
@@ -5561,6 +5841,11 @@ enum SelfTest {
             }
         }
 
+        // Card images are decoded at the size they are displayed: the image
+        // box's physical long edge, clamped to a floor (softness — the old
+        // 240 px bug that produced the "图片显示不清楚" report) and a ceiling
+        // (memory — a 6000 px screenshot must not blow up the panel). Both
+        // ends are pinned here; the target itself follows the real box.
         do {
             let width = 2000
             let height = 1200
@@ -5591,7 +5876,8 @@ enum SelfTest {
                 "Image decode fixture encodes a \(width)×\(height) PNG",
                 png != nil
             )
-
+            // 典型卡片图片框 250×150pt @2x → 解码长边应为 500（旧固定值 1024
+            // 在这个框上白占约 4 倍位图内存）。
             let target = StripThumbnailView.previewMaxPixel(
                 boxSize: CGSize(width: 250, height: 150),
                 displayScale: 2
@@ -5641,6 +5927,11 @@ enum SelfTest {
             )
         }
 
+        // Regression: the card row used to stop at a hard cap of 60, so on a
+        // big library ("切到默认工作区后只能看到一小部分内容，继续无法滑动查看
+        // 剩余内容") the rest of the history was unreachable. The row now pages
+        // through the result set: it renders the view model's window and pulls
+        // the next page when the reader reaches its end.
         do {
             MainActor.assumeIsolated {
                 let dir = FileManager.default.temporaryDirectory
@@ -5658,13 +5949,14 @@ enum SelfTest {
                     )!
 
                 )
-
+                // The default limit would trim the fixture before the pages
+                // can be counted.
                 settings.historyLimit = 0
                 let store = ClipStore(
                     baseDirectory: dir,
                     settingsStore: settings
                 )
-
+                // More rows than the first page holds.
                 let rowCount = PanelViewModel.listWindowPageSize + 250
                 for index in 0..<rowCount {
                     let text = "paging-\(index)"
@@ -5695,7 +5987,7 @@ enum SelfTest {
                         && vm.canLoadMoreCards,
                     detail: "first=\(firstPage)"
                 )
-
+                // The sentinel at the end of the row calls this.
                 vm.extendRenderedWindow()
                 let secondPage = vm.renderedClips.count
                 check(
@@ -5703,7 +5995,7 @@ enum SelfTest {
                     secondPage > firstPage,
                     detail: "\(firstPage) → \(secondPage)"
                 )
-
+                // Keep going until the row has everything.
                 var guardCount = 0
                 while vm.canLoadMoreCards, guardCount < 20 {
                     vm.extendRenderedWindow()
@@ -5720,6 +6012,16 @@ enum SelfTest {
             }
         }
 
+        // Regression: the app used to freeze solid on an image-heavy library.
+        // Every image card read its blob through the *synchronous* database
+        // bridge from inside a `Task`, so each card held a Swift-concurrency
+        // thread while waiting for a task that needed one; the copy path added
+        // one more wait. Once the waits outnumbered the pool's threads the
+        // process deadlocked — clipboard capture and the ⌃⌘V hotkey both went
+        // dead (measured on a 103k-row, 11.4 GB store with 2 005 image clips).
+        // This drives the same shape through the async API with a deadline: if
+        // image reads ever go back to blocking a cooperative thread, this fails
+        // instead of hanging the whole suite.
         do {
             MainActor.assumeIsolated {
                 let dir = FileManager.default.temporaryDirectory
@@ -5777,7 +6079,7 @@ enum SelfTest {
                         finished.signal()
                     }
                 }
-
+                // The copy path the freeze was reported on.
                 Task { @MainActor in
                     await vm.copyAsync(imageClips[0])
                     finished.signal()
@@ -5796,7 +6098,7 @@ enum SelfTest {
                     received == expected,
                     detail: "\(received)/\(expected) finished"
                 )
-
+                // The same burst must leave the store usable afterwards.
                 check(
                     "Store still answers after the image burst",
                     store.imageData(for: imageClips[0]) == png
@@ -5805,6 +6107,14 @@ enum SelfTest {
             }
         }
 
+        // The bottom popup is the app's only page now, so every module the
+        // ⌃⌘V main panel owned has to be reachable from it: the smart-tag
+        // filter menu, pin, the note and snippet editors, private cover,
+        // copy-before-transform and AI exclusion. The window geometry and key
+        // routing are covered above and by `--panel-presentation-probe`; this
+        // drives the module actions the popup's top bar and card menu call, and
+        // renders the page itself, so a blank body or a dead control fails the
+        // run instead of shipping.
         do {
             MainActor.assumeIsolated {
                 let dir = FileManager.default.temporaryDirectory
@@ -5873,6 +6183,7 @@ enum SelfTest {
                     detail: json.smartTag.rawValue
                 )
 
+                // 1. Smart-tag filter menu (the popup's 全部 menu).
                 vm.selectKindFilter(nil)
                 vm.selectSmartTagFilter(.json)
                 vm.filtersDidChange()
@@ -5899,6 +6210,8 @@ enum SelfTest {
                     detail: "\(vm.navigationOrder.count) 条"
                 )
 
+                // 2. Note editor: open from the card menu, save through the
+                //    floating card, and read it back off the row.
                 var done = false
                 vm.openNoteEditor(json)
                 check(
@@ -5921,6 +6234,7 @@ enum SelfTest {
                         && !vm.showNoteEditor
                 )
 
+                // 6. Private cover toggles without the old main panel.
                 done = false
                 Task { @MainActor in
                     await vm.togglePrivateAsync(url)
@@ -5938,6 +6252,7 @@ enum SelfTest {
                         } ?? true) == false
                 )
 
+                // The page itself renders: text and chrome, not a blank pane.
                 let page = Self.makeProbeImage(
                     view: QuickStripView(vm: vm),
                     size: NSSize(width: 900, height: 306)
@@ -6028,7 +6343,7 @@ enum SelfTest {
             check("Secure clear empties the history", store.items.isEmpty)
             try? FileManager.default.removeItem(at: dir)
         }
-
+        // 14. Clear-history FTS/image/rollback coverage.
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -6169,6 +6484,8 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // 4x. A clear without secure erase must not weaken the connection's
+        // default secure_delete mode (macOS ships SQLite with FAST/2).
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -6223,6 +6540,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // MARK: - Type presentation prefers the fine smart tag
         do {
             let yamlType = ClipTypePresentation.resolve(
                 kind: .text,
@@ -6274,6 +6592,7 @@ enum SelfTest {
             )
         }
 
+        // MARK: - Type taxonomy
         do {
             check(
                 "Type set is text/JSON/YAML/Markdown/image/file",
@@ -6289,6 +6608,7 @@ enum SelfTest {
             )
         }
 
+        // MARK: - v9 normalized text + SQL fast path parity
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -6344,6 +6664,8 @@ enum SelfTest {
                 kindFiltered.allSatisfy(\.isMatch)
             )
 
+            // P2a: scoring no longer re-reads bodies, so its order must equal
+            // the reference ranker that does.
             let scoringMismatches = SearchParity.scoringMismatches(
                 store: store,
                 queries: SearchParity.adversarialQueries()
@@ -6357,6 +6679,8 @@ enum SelfTest {
                 }.joined(separator: " | ")
             )
 
+            // Precision guard for grapheme clusters: SQLite's byte predicate
+            // would match the family emoji, Swift must not.
             let emojiEngine = LocalSearchEngine(
                 database: store.database,
                 store: store
@@ -6378,6 +6702,8 @@ enum SelfTest {
                 } ?? "no plan"
             )
 
+            // Ambiguous terms must be routed to the oracle, never guessed by
+            // the byte predicate.
             let ambiguousPlan = SearchParity.plans(for: "👨‍👩‍👧").first?.plan
             let ambiguousResponse = ambiguousPlan.map {
                 LocalSearchEngine(
@@ -6399,6 +6725,8 @@ enum SelfTest {
                     + " hits=\(ambiguousResponse?.clips.count ?? -1)"
             )
 
+            // The backfill must also cover rows written after it ran, and a
+            // note edited later must stay in sync.
             let noteClip = inserted.first
             var noteParityFailed = false
             if let noteClip, store.setNote("freshly-edited-note", for: noteClip) {
@@ -6416,6 +6744,7 @@ enum SelfTest {
                 !noteParityFailed
             )
 
+            // Real-library shape: probes derived from the stored rows.
             let rowProbes = SearchParity.compare(
                 store: store,
                 queries: SearchParity.probes(from: store)
@@ -6428,6 +6757,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // MARK: - Concurrent searches must not deadlock (blocking bridge)
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -6454,7 +6784,9 @@ enum SelfTest {
                     store: store
                 )
             )
-
+            // One blocked cooperative thread per core used to deadlock the
+            // pool: the searches blocked a thread waiting for a Task that
+            // needed one. They await the actor now, so all of them finish.
             let snapshot = store.searchSnapshot
             let concurrency = max(1, ProcessInfo.processInfo.activeProcessorCount)
             let group = DispatchGroup()
@@ -6478,6 +6810,7 @@ enum SelfTest {
             try? FileManager.default.removeItem(at: dir)
         }
 
+        // MARK: - v9 FTS index trust (conditional rebuild)
         do {
             let dir = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -6541,6 +6874,7 @@ enum SelfTest {
                 detail: "inserted=\(inserted) marker=\(String(describing: openMarker()))"
             )
 
+            // A clean index must not be rebuilt on the next launch.
             let skipped = openMarker()
             check(
                 "FTS 索引：校验通过时跳过重建",
@@ -6548,6 +6882,7 @@ enum SelfTest {
                 detail: "buildCount=\(String(describing: skipped?.buildCount))"
             )
 
+            // Drift the cheap check can see: a missing index row.
             let deleted = exec("DELETE FROM clips_fts WHERE rowid = 1")
             let afterDelete = openMarker()
             check(
@@ -6556,6 +6891,8 @@ enum SelfTest {
                 detail: "buildCount=\(String(describing: afterDelete?.buildCount))"
             )
 
+            // Drift only the content spot check can see: same byte length,
+            // different text.
             let rewritten = exec("""
                 UPDATE clips_fts SET text = 'index-check-betx' WHERE rowid = 2
                 """)
@@ -6566,6 +6903,7 @@ enum SelfTest {
                 detail: "buildCount=\(String(describing: afterRewrite?.buildCount))"
             )
 
+            // The strong check must name what is wrong, not just fail.
             let tampered = exec("""
                 UPDATE clips_fts SET note = 'note-tampered' WHERE rowid = 3
                 """)
@@ -6586,6 +6924,8 @@ enum SelfTest {
                 detail: strongDetail
             )
 
+            // A normalizer change invalidates the marker without anyone
+            // bumping a version number.
             let probeEdited = exec("""
                 UPDATE store_meta SET value = replace(value, '"abc"', '"XYZ"')
                 WHERE key = 'fts.index_marker'
@@ -6607,6 +6947,33 @@ enum SelfTest {
         return Int32(failures)
     }
 
+    // MARK: - Panel probes
+    //
+    // Rewritten on 2026-09-23: the originals were lost while deleting the
+    // AI-enhanced search module, and no copy existed on this machine (see
+    // docs/verification.md). These cover the same ground — geometry, backdrop,
+    // pointer and keyboard paths on a real window, and the retention rules that
+
+    /// `--api-probe`：本地控制面（M2）的硬规则自检。
+    ///
+    /// 覆盖设计稿第 11 节列的不变量：私密条目**在任何动词下取不到**（且对外表现为
+    /// "不存在"）、作用域逐动词生效、写动词走真实捕获闸、`copy` 不产生新条目、
+    /// 审计不含正文、限流生效、socket 往返可用。
+    ///
+    /// 全程在隔离世界（store / 规则 / 令牌 / 设置都是临时目录与临时 suite），
+    /// 所以它既不会碰用户的真实数据，也不会因为用户的真实开关状态而变红或变绿。
+    /// M3（私密内容加密）的硬规则自检。
+    ///
+    /// 它要回答的不是"加减密函数对不对"——那是最容易测的一部分。真正会出事的是
+    /// 三个问题：
+    ///   1. 密钥是否**真的在钥匙串里**（而不是落在库里、或只是恰好还在内存中）；
+    ///   2. 私密正文是否**真的不在文件里**：直接扫 `clips.sqlite` 与其 WAL 的字节，
+    ///      绕过所有解密路径去找明文。这是"读不到"唯一能自证的方式；
+    ///   3. 索引三处（`norm_*`、`clips_fts`、内存索引）是否也没有第二份可检索的
+    ///      副本，并且"搜不到"在三层上一致。
+    ///
+    /// 每一组断言都配一个**对照组**（同样的扫描能找到普通条目的明文、同样的查询
+    /// 能找到普通条目），否则"扫不到"可能只是因为什么都没扫到。
     @MainActor
     static func cryptoProbe() -> Int32 {
         var failures = 0
@@ -6618,6 +6985,8 @@ enum SelfTest {
                 failures += 1
             }
         }
+
+        // MARK: 1. 信封本身（纯函数，不碰钥匙串）
 
         let key = (try? StoreCrypto.generateKey()) ?? Data()
         expect(
@@ -6637,7 +7006,7 @@ enum SelfTest {
             (try? StoreCrypto.open(sealedAgain, key: key)) == "13812345678",
             "第二条同样解得开"
         )
-
+        // 改动密文里的一个字节：必须**解不开**，而不是解出一段垃圾明文。
         var tampered = Array(sealed.utf8)
         if tampered.count > 24 {
             tampered[24] = tampered[24] == 65 ? 66 : 65
@@ -6662,24 +7031,29 @@ enum SelfTest {
         )
         expect(StoreCrypto.openStored("") == "", "空串原样返回")
 
+        // MARK: 2. 钥匙串（密钥不在库里）
+
         let probePlain = "钥匙串留存探测 \(UUID().uuidString)"
         let probeSealed = (try? StoreCrypto.sealForStorage(probePlain)) ?? ""
         expect(
             StoreCrypto.isEnvelope(probeSealed),
             "用钥匙串密钥加密成功（首次运行时在这一步生成）"
         )
-
+        // 状态要在**确保密钥之后**查：首次运行时它确实还不存在，
+        // 先查会得到一个"什么都没有"的假失败。
         let keyStatus = StoreCrypto.keyStatus()
         expect(
             keyStatus.present && keyStatus.error == nil,
             "钥匙串里有数据密钥（\(keyStatus.error ?? "ok")）"
         )
-
+        // 真正的证据：丢掉进程内缓存、重新问一次钥匙串，还能解开。
         StoreCrypto.forgetCachedKey()
         expect(
             StoreCrypto.openStored(probeSealed) == probePlain,
             "丢掉缓存后仍解得开（密钥确实在钥匙串，而不是在内存里）"
         )
+
+        // MARK: 3. 落盘证据（走真实库路径）
 
         let root = ClipStore.defaultBaseDirectory()
         let settings = SettingsStore(
@@ -6695,15 +7069,20 @@ enum SelfTest {
         let dbURL = root.appendingPathComponent("clips.sqlite")
         let walURL = URL(fileURLWithPath: dbURL.path + "-wal")
 
+        /// 直接扫文件字节找一段明文。绕过所有解密路径：不看代码怎么想，看文件里有什么。
         func fileContains(_ needle: String, at url: URL) -> Bool {
             guard let data = try? Data(contentsOf: url) else { return false }
             return data.range(of: Data(needle.utf8)) != nil
         }
-
+        /// **主文件与 WAL 都要扫**：刚提交的数据可能还在 WAL 里（SQLite 的正常形态），
+        /// 只扫主文件会得出"文件里没有明文"这种自我安慰的结论。对照组的存在就是为了
+        /// 防止这种假绿——它必须能在同一时刻找到普通条目的明文。
         func storedPlaintextLeaked(_ needle: String) -> Bool {
             fileContains(needle, at: dbURL) || fileContains(needle, at: walURL)
         }
 
+        // 两条夹具各带一个随机串：私密那条**不该**出现在库里，普通那条**必须**
+        // 出现——后者就是扫描本身的对照组。
         let privateMarker = "M3-PRIVATE-\(UUID().uuidString)"
         let controlMarker = "M3-CONTROL-\(UUID().uuidString)"
         let privateBody = "私密正文 \(privateMarker)"
@@ -6724,7 +7103,8 @@ enum SelfTest {
                 sourceApp: "Terminal"
             )
         )
-
+        // 按各自的随机串取，不靠 `isPrivate`：这样即便将来隔离目录改成复用的，
+        // 取到的也一定是本次插入的那两条。
         guard let privateClip = store.items.first(where: {
                   $0.text.contains(privateMarker)
               }),
@@ -6752,6 +7132,7 @@ enum SelfTest {
             "WAL 里也找不到（改前的整页镜像已被检查点截断）"
         )
 
+        // 直接读库（另一条连接，不经过任何解密代码）验证三处都不留明文副本。
         let raw = try? DatabaseConnection(path: dbURL.path)
         func storedValue(_ sql: String, _ dbID: Int64) -> String {
             guard let raw else { return "" }
@@ -6800,6 +7181,7 @@ enum SelfTest {
             "对照组：普通条目仍在 FTS 索引里"
         )
 
+        // 内存索引同样不留副本，但条目仍在"列表"里（私密卡片照样看得见）。
         expect(
             store.memoryIndex.allIDs().contains(privateClip.dbID),
             "私密条目仍在列表里（不是被隐藏）"
@@ -6810,6 +7192,7 @@ enum SelfTest {
             "内存索引里没有私密正文"
         )
 
+        // 端到端搜索：同样的查询，私密搜不到、普通搜得到。
         let engine = LocalSearchEngine(database: store.database, store: store)
         let privateHits = engine.search(
             query: privateMarker,
@@ -6826,6 +7209,8 @@ enum SelfTest {
             controlHits.contains(controlClip.dbID),
             "对照组：同样的查询能找到普通条目（搜索本身是好的）"
         )
+
+        // MARK: 4. 取消私密 → 明文与索引副本都回来；再设回私密
 
         expect(store.togglePrivate(dbID: privateClip.dbID), "取消私密成功")
         expect(
@@ -6861,6 +7246,11 @@ enum SelfTest {
             "再设回私密后落盘又是密文"
         )
 
+        // MARK: 5. 迁移：老库形态（私密行是明文）交给启动迁移处理
+
+        // 造法：先按普通条目插入（走明文路径，`norm_*` 与 FTS 都写好了），再用探针
+        // 自己的连接把 `is_private` 拧成 1、并删掉加密标记——这正是 M3 之前那些库
+        // 的样子（私密只在 UI 遮挡，库里是明文）。
         let legacyMarker = "M3-LEGACY-\(UUID().uuidString)"
         let legacyBody = "老库私密 \(legacyMarker)"
         _ = store.insert(
@@ -6913,6 +7303,12 @@ enum SelfTest {
             "迁移不碰已加密的行（幂等）"
         )
 
+        // MARK: 6. 跨重建留存（钥匙串里的密钥是同一把）
+
+        // 刻意放在**与库目录无关**的固定路径：库目录是按进程 PID 建的，放那里
+        // 每次都是新文件，这一项就会永远显示"首次运行"——一个自欺欺人的绿。
+        // 放在这里，它验证的才是那件真会出事的事：ad-hoc 签名的应用每次重建
+        // cdhash 都变，钥匙串条目的 ACL 会不会因此读不到自己写的密钥。
         let envelopeFile = FileManager.default.temporaryDirectory
             .appendingPathComponent("clipa-crypto-probe-envelope.txt")
         let previous = (
@@ -6929,6 +7325,9 @@ enum SelfTest {
         try? (try? StoreCrypto.sealForStorage("clipa-crypto-probe"))?
             .write(to: envelopeFile, atomically: true, encoding: .utf8)
 
+        // 私密图片加密（2026-10-02）：图片字节以 AES-GCM 密文写进
+        // clip_images.blob（magic 前缀 CLIPAE1），原始字节不得出现在
+        // clips.sqlite 或 WAL 里；对照组是公开图片明文在文件里。
         do {
             let publicPNG = Self.makeProbePNG(width: 150, height: 100)
             let togglePNG = Self.makeProbePNG(width: 96, height: 64)
@@ -6942,7 +7341,7 @@ enum SelfTest {
                     $0.contentHash == ContentHasher.hash(data: data)
                 }
             }
-
+            // 对照组：公开图片，明文落盘。
             _ = store.insert(
                 NewClip(
                     kind: .image,
@@ -6953,7 +7352,7 @@ enum SelfTest {
                     contentHash: ContentHasher.hash(data: publicPNG!)
                 )
             )
-
+            // toggle 路径：公开 → togglePrivate（与面板同一调用）→ seal。
             _ = store.insert(
                 NewClip(
                     kind: .image,
@@ -6964,7 +7363,8 @@ enum SelfTest {
                     contentHash: ContentHasher.hash(data: togglePNG!)
                 )
             )
-
+            // 迁移路径：插入时就是私密（加密引入前的存量形态），blob 明文，
+            // 由启动补加密改写。
             _ = store.insert(
                 NewClip(
                     kind: .image,
@@ -7022,7 +7422,10 @@ enum SelfTest {
             } else {
                 expect(false, "迁移路径的 fixture 入库")
             }
-
+            // 文件级扫描：先做一次 WAL checkpoint（TRUNCATE），把改写后的
+            // 最终状态落进主文件——否则改写前留在 WAL 里的旧明文页会被误判
+            // 为泄漏。生产语义：改写前的那一帧明文可能在 WAL 里短暂存在到
+            // 下一次 checkpoint，与任何 SQLite 更新相同，由自动检查点回收。
             if let checkpoint = try? DatabaseConnection(path: dbURL.path) {
                 _ = try? checkpoint.prepare("PRAGMA wal_checkpoint(TRUNCATE)") {
                     statement in
@@ -7074,6 +7477,7 @@ enum SelfTest {
             return 1
         }
 
+
         APITokenStore.shared.reload()
         APITokenStore.shared.revokeAll()
         let metaToken = try? APITokenStore.shared.create(
@@ -7093,6 +7497,7 @@ enum SelfTest {
             return 1
         }
 
+        // 夹具：普通（含手机号）、私密（含手机号）、敏感、文件。
         let phone = "13113128089"
         let privatePhone = "13900139000"
         _ = store.insert(
@@ -7126,7 +7531,8 @@ enum SelfTest {
                 sourceApp: "Finder"
             )
         )
-
+        // 长文夹具（2026-10-03）：5000 字节，超过旧的 4096 截断上限——
+        // 证明 read.full 令牌 get 到的是**整条**（truncated=false）。
         let longBody = String(repeating: "甲乙丙丁戊己庚辛壬癸", count: 500)
         _ = store.insert(
             NewClip(
@@ -7141,6 +7547,8 @@ enum SelfTest {
         expect(privateClip != nil, "夹具里有私密条目")
         expect(normalClip != nil, "夹具里有普通条目")
 
+        // 写剪贴板的动作注入成"只记录"：于是"私密条目绝不被复制"可以直接断言成
+        // "它没被调用"。真实写入器的抑制链在别的用例里已经覆盖。
         var copiedClipID: UUID?
         let service = APIControlService(
             store: store,
@@ -7152,6 +7560,7 @@ enum SelfTest {
             }
         )
 
+        /// 同步探针里等一次 async 调用：塞进箱子再泵 runloop（沿用仓库既有写法）。
         func call(
             _ verb: String,
             token: String,
@@ -7190,12 +7599,14 @@ enum SelfTest {
             response.error?.code
         }
 
+        // 1. 开关关闭 → not_enabled
         expect(
             code(call("status", token: fullToken.secret)) == "not_enabled",
             "接口关闭时拒绝一切请求"
         )
         settings.apiControlEnabled = true
 
+        // 2. 令牌
         expect(
             code(call("status", token: "clipa_wrong")) == "not_authorized",
             "错令牌 → not_authorized"
@@ -7206,6 +7617,7 @@ enum SelfTest {
             "协议版本不符 → version_mismatch"
         )
 
+        // 3. status
         let status = call("status", token: fullToken.secret)
         expect(status.ok && status.status?.tokenLabel == "full", "status 报出令牌身份")
         expect(
@@ -7214,6 +7626,7 @@ enum SelfTest {
             "status 报出作用域与写能力"
         )
 
+        // 4. 只有 meta 的令牌：看不到正文，也不能取单条
         let metaSearch = call(
             "search",
             token: metaToken.secret,
@@ -7230,7 +7643,10 @@ enum SelfTest {
                 == "not_authorized",
             "meta 令牌不能取单条"
         )
-
+        // P2 修复（2026-10-03）：get 的作用域是 **read.full**。旧实现只查
+        // search.text + 4096 字节截断——剪贴板内容大多短于 4KB，read.full
+        // 对 get 等于没约束（用户实测报告）。现在：text-only 令牌 get 被拒，
+        // 片段只能走 search；read.full 令牌长文也返回整条。
         expect(
             code(call("get", token: textToken.secret, id: normalClip?.id.uuidString))
                 == "not_authorized",
@@ -7263,6 +7679,7 @@ enum SelfTest {
             )
         }
 
+        // 5. 全权令牌：私密与原始号码都不在结果里
         let fullSearch = call(
             "search",
             token: fullToken.secret,
@@ -7276,7 +7693,9 @@ enum SelfTest {
             !results.contains { $0.id == privateClip?.id.uuidString },
             "私密条目不在检索结果里"
         )
-
+        // 规则包（redact.md / skip.md / tags.md）已于 2026-09-27 删除，`redacted`
+        // 恒为 false（字段留在协议里，是为了不破坏客户端解析）。
+        // 片段上限 2026-10-03 收紧到 2 字节：search 只给指纹，正文走 get。
         expect(
             !rawJSON.contains(privatePhone),
             "私密条目的号码不在结果里"
@@ -7293,6 +7712,9 @@ enum SelfTest {
             )
         }
 
+        // 5b. 分页（2026-10-01 U1）：offset + limit 翻完必须**不重不漏正好一全量**；
+        // 越界 offset 是空页；私有（此处为普通）条目不会因翻页多出副本 ——
+        // 分页在过滤之后切片，这条断言钉住的就是这个次序。
         do {
             let prefix = "PagingProbe-\(UUID().uuidString.prefix(6))"
             for index in 0..<7 {
@@ -7355,6 +7777,7 @@ enum SelfTest {
             )
         }
 
+        // 6. 私密 id：与"不存在"不可区分
         if let privateClip {
             let denied = call(
                 "get",
@@ -7372,7 +7795,10 @@ enum SelfTest {
                 "私密与不存在返回同一个错误码（不可区分）"
             )
         }
-
+        // 6b. id 前缀：CLI 的人类可读 search 输出打印的就是前 8 位，所以它必须能用。
+        // 原先不能用（`resolve` 只认完整 UUID）——那份输出于是给出一个没法用的 id，
+        // 照着它敲 `copy` 只会得到"找不到"。`--json` 一直是完整的，所以这个缺陷只在
+        // 人手敲的时候露出来。
         if let normalClip {
             let prefix = String(normalClip.id.uuidString.prefix(8))
             let byPrefix = call("get", token: fullToken.secret, id: prefix)
@@ -7412,6 +7838,9 @@ enum SelfTest {
             "匹配不到任何条目的 id → not_found（退出码与原先一致，仍是 1）"
         )
 
+        // 6c. 歧义前缀必须被**拒绝**，不能随便挑一条 —— 挑错就是"复制了别的东西"。
+        // 夹具得能指定 id 才造得出歧义，所以这里插两条共享前缀的条目，用完立刻删
+        // （正文不同，否则会被内容去重折成一条，断言就成了假的）。
         let sharedPrefix = "AAAABBBB"
         let ambiguousIDs = [
             "\(sharedPrefix)-0000-0000-0000-000000000001",
@@ -7439,6 +7868,7 @@ enum SelfTest {
             "删掉歧义夹具后同一前缀变成 not_found（夹具已收尾）"
         )
 
+        // 7. copy：作用域、私密、以及"有没有被调用"
         if let privateClip {
             copiedClipID = nil
             let response = call(
@@ -7468,12 +7898,17 @@ enum SelfTest {
             expect(copiedClipID == normalClip.id, "复制的是那条")
         }
 
+        // 8. put：真实捕获闸
+        //
+        // 这条文本原来命中的是规则包 `skip.md`，规则包删除后它应当**被接受**。
+        // 这不是放松闸门：紧接着的敏感内容依然被同一条闸拦下。
         let putPlain = call(
             "put",
             token: fullToken.secret,
             text: "INTERNAL-TICKET-42"
         )
-
+        // 注意判的是 `ok` 而不是 `code`：成功响应没有错误码，`code()` 会返回 nil，
+        // 写成 `code(...) == "ok"` 会永远失败（这条就是我第一版写错的地方）。
         expect(
             putPlain.ok,
             "put 不再被规则包拒绝（skip.md 已删除）"
@@ -7505,6 +7940,7 @@ enum SelfTest {
             "缺 put 作用域被拒"
         )
 
+        // 9. note
         if let normalClip {
             expect(
                 code(call("note", token: metaToken.secret, id: normalClip.id.uuidString, note: "x"))
@@ -7524,6 +7960,7 @@ enum SelfTest {
             )
         }
 
+        // 10. 审计：有条数、有拒绝记录、且不含正文
         let auditURL = APIAuditLog.url(rootDirectory: root)
         let auditText = (try? String(contentsOf: auditURL, encoding: .utf8)) ?? ""
         let entries = APIAuditLog.recent(200, rootDirectory: root)
@@ -7544,6 +7981,7 @@ enum SelfTest {
             "令牌的使用次数被记下来"
         )
 
+        // 11. 限流：第 61 次必须被挡
         var limited = false
         for _ in 0..<(APIControlService.rateLimitPerMinute + 2) {
             let response = call("status", token: metaToken.secret)
@@ -7554,6 +7992,7 @@ enum SelfTest {
         }
         expect(limited, "超过每分钟上限后被限流")
 
+        // 12. socket 往返：真起一个服务端（指向隔离世界），走一次完整协议
         let server = APIControlServer.shared
         APIControlServer.shared.start(
             store: store,
@@ -7563,8 +8002,14 @@ enum SelfTest {
         let socketURL = APIControlServer.socketURL(rootDirectory: root)
         expect(server.isRunning, "服务端已监听")
         expect(APIControlServer.canConnect(to: socketURL), "socket 可连接")
+        let secondServer = APIControlServer()
+        secondServer.start(store: store, settings: settings, rootDirectory: root)
+        expect(!secondServer.isRunning, "第二实例不能接管正在服务的 socket")
+        secondServer.stop()
+        expect(APIControlServer.canConnect(to: socketURL), "停止第二实例不会删除第一实例的 socket")
         expect(
-
+            // 这条是**真的安全检查**，所以不因为 M1 模块被删就丢掉：
+            // 原来调的是 `APIExport.isOwnerOnly`，现在直接查文件的权限位。
             {
                 let attributes = try? FileManager.default
                     .attributesOfItem(atPath: socketURL.path)
@@ -7574,7 +8019,8 @@ enum SelfTest {
             }(),
             "socket 权限是 0600"
         )
-
+        // P0 修复（2026-10-02）：SIGPIPE 守卫。对端断开后的 send/write 必须是
+        // EPIPE 错误而不是杀死进程——两个分支都钉：坏 fd 失败、真 socket 成功。
         expect(
             SocketProtection.disableSigPipe(-1) == false,
             "坏 fd 上 SO_NOSIGPIPE 设置失败（守卫的假分支）"
@@ -7589,7 +8035,8 @@ enum SelfTest {
         wireRequest.schema = APIContract.protocolVersion
         wireRequest.token = fullToken.secret
         wireRequest.verb = "status"
-
+        // 客户端要放到别的线程去跑：服务端的策略层是 `@MainActor`，而探针自己就占着
+        // 主线程 —— 在主线程上同步等一个"需要主线程才能回答"的请求会自己等自己。
         var wire: APIResponse?
         DispatchQueue.global().async {
             wire = APIClientCLI.send(
@@ -7626,13 +8073,16 @@ enum SelfTest {
                 ? "[API] OK"
                 : "[API] \(failures) failure(s)"
         )
-
+        // 探针自己的痕迹不留给下一次：令牌、审计、socket 都清掉。
         APITokenStore.shared.revokeAll()
-
+        // 10. delete（2026-10-02）：高危写动词单独一把作用域锁；删完真的不存在；
+        // 私密条目对 delete 与对 get 一样"按不存在处理"——能读到才删得掉。
+        // 用块内新建的令牌：这一段排在撤销测试之后，fullToken 可能已失效。
         do {
             let deleteToken = try? APITokenStore.shared.create(
                 label: "delete-probe",
-
+                // read.full：删完用 get 验证"真的不存在"（2026-10-03 起 get
+                // 要求 read.full，没有它 get 会先被作用域拦下）。
                 scopes: [.searchMeta, .searchText, .readFull, .delete]
             )
             if let normalClip, let deleteToken {
@@ -7671,7 +8121,8 @@ enum SelfTest {
                     "有作用域时 delete 成功"
                 )
                 expect(
-
+                    // deleteReader 现在带 read.full：get 能越过作用域、如实
+                    // 报 not_found。
                     code(call("get", token: deleteReader.secret, id: doomedID))
                         == "not_found",
                     "删除后这条真的不存在了"
@@ -7692,6 +8143,9 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+
+    /// `--api-export-probe` 用的解码目标：**独立写一遍**是有意的——
+    /// 它同时充当"对外字段契约"的检查，改了字段名这里会立刻红。
     private struct ProbeEnvelope: Decodable {
         let schema: Int
         let count: Int
@@ -7711,7 +8165,12 @@ enum SelfTest {
     }
 
     @MainActor
-
+    /// `--mcp-probe`：MCP stdio 薄壳的**管道**自检。
+    ///
+    /// 策略层（令牌 / 作用域 / 私密硬排除）不在这里验 —— 那是 `--api-probe` 的事，
+    /// 薄壳只是把 JSON-RPC 翻译成对同一条 CLI 管道的调用。这里钉的是：
+    /// initialize 握手、tools/list 的工具清单、tools/call 真的走一遍
+    /// 「JSON-RPC 参数 → CLI → socket → APIResponse 包络」的往返、错误路径。
     static func mcpProbe() -> Int32 {
         var failures = 0
         var checks = 0
@@ -7722,7 +8181,8 @@ enum SelfTest {
                 failures += 1
             }
         }
-
+        /// 发一行 JSON-RPC，收第一行回包。每条消息起一个新薄壳进程：
+        /// 慢一点，但进程边界让"薄壳循环卡死"也会被暴露成超时/空回包。
         func rpc(_ line: String) -> [String: Any]? {
             let process = Process()
             process.executableURL = URL(
@@ -7747,7 +8207,7 @@ enum SelfTest {
                   let object = try? JSONSerialization.jsonObject(
                       with: Data(first)
                   ) as? [String: Any] else {
-
+                // 临时调试（2026-10-03）：看子进程实际输出与退出状态。
                 print(
                     "[MCP] raw(<\(data.count)B, term=\(process.terminationStatus))="
                         + (String(data: data.prefix(400), encoding: .utf8) ?? "非UTF-8")
@@ -7757,6 +8217,7 @@ enum SelfTest {
             return object
         }
 
+        // 1. initialize：客户端带的版本在认识范围内就回同一个。
         let initObject = rpc(
             #"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#
         )
@@ -7771,6 +8232,7 @@ enum SelfTest {
             "serverInfo.name 是 clipa"
         )
 
+        // 2. tools/list：六个工具，与六个动词一一对应。
         let listObject = rpc(#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
         let tools = ((listObject?["result"] as? [String: Any])?["tools"]
             as? [[String: Any]]) ?? []
@@ -7783,6 +8245,12 @@ enum SelfTest {
             "工具清单与七个动词一一对应（\(names.sorted())）"
         )
 
+        // 3. tools/call：回包应当是**可解析的 APIResponse 包络**，且被真实策略层
+        //    拒之门外 —— 拒绝码因环境而异（控制面没开 = not_enabled；开着但
+        //    隔离令牌仓库里没有客户端读到的那个真实令牌 = not_authorized）。
+        //    两种都证明同一件事：JSON-RPC 参数真的走到了策略层，薄壳没有自己编答案。
+        //    （原先断言写死 not_enabled，在"用户已真实开启控制面"的机器上必然红 ——
+        //    是探针的环境依赖，不是管道坏了。）
         let callObject = rpc(
             #"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"clipa_status","arguments":{}}}"#
         )
@@ -7790,7 +8258,10 @@ enum SelfTest {
         let content = (callResult?["content"] as? [[String: Any]])?
             .first?["text"] as? String
         let envelope = content.flatMap {
-
+            // 与服务层同款键策略（2026-10-03）：status 成功回包含 clip_count
+            // 等 snake_case 键——这台机器上有了真实令牌后 tools/call 会成功，
+            // 不开 convertFromSnakeCase 就解不出来（以前只会收到拒绝包络，
+            // 全是单词键，把这个缺口掩盖了）。
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             return try? decoder.decode(
@@ -7799,7 +8270,10 @@ enum SelfTest {
             )
         }
         expect(envelope != nil, "tools/call 带回可解析的 APIResponse 包络")
-
+        // 三种合法结局（2026-10-03 补第三种）：控制面没开 = not_enabled；
+        // 开了但令牌对不上 = not_authorized；**机器上真有可用令牌时 =
+        // 真成功**（ok=true，比如用户建过 ~/.config/clipa/token）。三者都
+        // 证明同一件事：JSON-RPC 参数真的走到了策略层，薄壳没有自己编答案。
         let gateCodes: Set<String> = [
             APIErrorCode.notEnabled.rawValue,
             APIErrorCode.notAuthorized.rawValue,
@@ -7815,12 +8289,14 @@ enum SelfTest {
             "isError 与包络的 ok 一致"
         )
 
+        // 4. 未知方法。
         let unknown = rpc(#"{"jsonrpc":"2.0","id":4,"method":"no/such"}"#)
         expect(
             (unknown?["error"] as? [String: Any])?["code"] as? Int == -32601,
             "未知方法返回 -32601"
         )
 
+        // 5. 坏 JSON。
         let broken = rpc("this is not json")
         expect(
             (broken?["error"] as? [String: Any])?["code"] as? Int == -32700,
@@ -7854,119 +8330,27 @@ enum SelfTest {
         let top = titles(menu)
         print("[MENU] 顶级项: " + top.joined(separator: " | "))
 
-        expect(
-            !top.contains("忽略当前前台应用"),
-            "顶级项不再有单独的“忽略当前前台应用”"
-        )
-        expect(!top.contains("已忽略的应用"), "顶级项不再有单独的“已忽略的应用”")
-        expect(!top.contains("跳过规则"), "顶级项不再有单独的“跳过规则”")
-        let module = menu.items.first { $0.title == "忽略与跳过" }
-        expect(module?.submenu != nil, "存在合并后的“忽略与跳过”子菜单")
-
-        for item in menu.items {
-            guard let submenu = item.submenu else { continue }
-            expect(
-                !submenu.autoenablesItems,
-                "子菜单「\(item.title)」关闭了自动启用"
-            )
+        expect(top == ["打开剪贴板", "登录时启动", "设置…", "关于 Clipa…", "退出 Clipa"],
+               "菜单按指定顺序仅保留五个入口")
+        expect(!menu.autoenablesItems, "菜单显式管理启用状态")
+        expect(menu.items.allSatisfy { $0.submenu == nil && !$0.isSectionHeader },
+               "无旧子菜单或额外状态标题")
+        for item in menu.items where !item.isSeparatorItem {
+            expect(item.action != nil && item.isEnabled, "入口「\(item.title)」可操作")
         }
-
-        guard let rules = module?.submenu else {
-            print("[MENU] 读不到子菜单，结构断言到此为止")
-            print("[MENU] \(failures == 0 ? "OK" : "FAILED") 检查 \(checks) 项")
-            return failures == 0 ? 0 : 1
-        }
-        let ruleTitles = titles(rules)
-        print("[MENU] 忽略与跳过: " + ruleTitles.joined(separator: " | "))
-
-        let expectedRules: [(String, KeyPath<SettingsStore, Bool>)] = [
-            ("跳过标记为机密的复制内容", \.skipConfidentialPasteboard),
-            ("跳过疑似敏感内容", \.skipSensitive),
-            ("跳过密码管理器复制的内容", \.ignorePasswordManagers)
-        ]
-        for (title, flag) in expectedRules {
-            let item = rules.items.first { $0.title == title }
-            expect(item != nil, "有规则「\(title)」")
-            guard let item else { continue }
-            expect(
-                (item.state == .on) == settings[keyPath: flag],
-                "「\(title)」勾选与偏好一致（item=\(item.state == .on)"
-                    + " store=\(settings[keyPath: flag])）"
-            )
-            expect(item.isEnabled, "规则「\(title)」可点")
-        }
-        expect(
-            !ruleTitles.contains("自动跳过密码管理器"),
-            "密码管理器规则不再藏在应用清单里"
-        )
-
-        let target = rules.items.first {
-            $0.title.hasPrefix("忽略") || $0.title.hasPrefix("已忽略")
-                || $0.title.hasPrefix("无法忽略")
-        }
-        expect(target != nil, "有“忽略当前前台应用”那一行")
-        if let target {
-            print(
-                "[MENU] 目标行: \(target.title)"
-                    + " enabled=\(target.isEnabled)"
-                    + " id=\(target.representedObject as? String ?? "-")"
-            )
-            expect(
-                target.isEnabled == (target.representedObject != nil),
-                "该行可点当且仅当带着要忽略的 bundle id"
-            )
-            if let bundleID = target.representedObject as? String {
-                expect(
-                    !settings.ignoredApps.contains(bundleID),
-                    "可点的那一行不指向已在清单里的应用"
-                )
-            }
-        }
-
-        let removals = rules.items.filter { $0.title.hasPrefix("不再忽略") }
-        expect(
-            removals.count == settings.ignoredApps.count,
-            "清单条数与偏好一致（\(removals.count) vs "
-                + "\(settings.ignoredApps.count)）"
-        )
-        if settings.ignoredApps.isEmpty {
-            let empty = rules.items.first { $0.title.contains("还没有手动忽略") }
-            expect(empty != nil, "清单为空时给出说明")
-            expect(empty?.isEnabled == false, "说明本身不可点")
-        } else {
-            expect(
-                removals.allSatisfy {
-                    ($0.representedObject as? String) != nil
-                },
-                "每条清单项都带着自己的 bundle id"
-            )
-        }
-
-        let clearMenu = menu.items.first { $0.title == "清空历史" }?.submenu
-        expect(clearMenu != nil, "存在「清空历史」子菜单")
-        let limitItem = clearMenu?.items.first {
-            $0.title.hasPrefix("历史条数上限：")
-        }
-        expect(limitItem != nil, "有「历史条数上限」条目")
-        expect(
-            limitItem?.title
-                == AppDelegate.historyLimitMenuTitle(limit: settings.historyLimit),
-            "上限标题与当前偏好一致（item=\(limitItem?.title ?? "nil")）"
-        )
-        expect(limitItem?.isEnabled == true, "「历史条数上限」可点")
-        let autoPauseItem = clearMenu?.items.first {
-            $0.title == "达到上限时自动暂停记录"
-        }
-        expect(autoPauseItem != nil, "有「达到上限时自动暂停记录」条目")
-        expect(
-            autoPauseItem?.state == (settings.autoPauseAtLimit ? .on : .off),
-            "自动暂停勾选与偏好一致"
-        )
+        let open = menu.items.first { $0.title == "打开剪贴板" }
+        expect(open?.keyEquivalent.isEmpty == true, "全局快捷键不重复注册")
+        let launch = menu.items.first { $0.title == "登录时启动" }
+        expect(launch?.state == (settings.launchAtLogin ? .on : .off), "登录启动勾选与偏好一致")
+        expect(menu.items.first { $0.title == "设置…" }?.keyEquivalent == ",", "保留设置快捷键")
+        expect(menu.items.first { $0.title == "退出 Clipa" }?.keyEquivalent == "q", "保留退出快捷键")
 
         print("[MENU] \(failures == 0 ? "OK" : "FAILED") 检查 \(checks) 项")
         return failures == 0 ? 0 : 1
     }
 
+    /// `--panel-presentation-probe`: the popup's geometry, its backdrop, and the
+    /// pointer / keyboard paths, on a real panel.
     @MainActor
     static func panelPresentationProbe() -> Int32 {
         var failures = 0
@@ -7979,6 +8363,7 @@ enum SelfTest {
             }
         }
 
+        // 1. The frame math the layout and the click probes share.
         let screen = NSScreen.main?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let target = QuickStripController.panelFrame(in: screen)
         let start = QuickStripController.startFrame(for: target)
@@ -7986,7 +8371,8 @@ enum SelfTest {
             "[PANEL] quick strip (centered): frame=\(target) screen=\(screen)"
                 + " inside=\(screen.contains(target))"
         )
-
+        // 2026-10-04 对齐 Spotlight：水平居中、垂直中心 54%、宽 ≤640、
+        // 滑入起点在静止位下方 48pt。
         expect(
             abs(target.midX - screen.midX) < 0.5
                 && abs(target.midY - screen.height * 0.54) < 0.5
@@ -8001,6 +8387,7 @@ enum SelfTest {
             "滑入起点在静止位置下方 48pt"
         )
 
+        // 2. A real panel with fixtures.
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(
                 "ClipaPanelProbe-\(UUID().uuidString)",
@@ -8035,6 +8422,8 @@ enum SelfTest {
                 + " expected=\(resting)"
         )
         expect(controller.isVisible, "show() 之后面板可见")
+        expect(controller.contentWindow.appearance == nil, "面板跟随系统外观，不强制浅色")
+        expect(controller.contentWindow.hasShadow, "浮动面板使用系统窗口阴影")
         expect(
             controller.windowFrame == resting,
             "静止位置 = 计算的居中浮动态"
@@ -8044,6 +8433,7 @@ enum SelfTest {
             "窗口宽度 = 计算宽度"
         )
 
+        // 3. The backdrop is a real blur, not a flat fill.
         func effectViews(in view: NSView) -> [NSView] {
             var found = view.subviews.filter {
                 String(describing: type(of: $0)).contains("GlassEffectView")
@@ -8070,9 +8460,11 @@ enum SelfTest {
         )
         expect(glass || legacyBlur, "底板是窗口后模糊 / 液态玻璃")
 
+        // 4. Fixture rows reached the view model.
         let cardIDs = Array(controller.viewModel.navigationOrder.prefix(8))
         expect(cardIDs.count >= 6, "面板拿到了夹具行（\(cardIDs.count)）")
 
+        // 5. Mouse click on card #3 selects it.
         if cardIDs.count >= 3,
            let third = store.clip(id: cardIDs[2]) {
             controller.viewModel.select(third)
@@ -8099,6 +8491,9 @@ enum SelfTest {
             expect(controller.viewModel.selectedID == third.id, "点第三张卡片即选中它")
         }
 
+
+        // 7. Typing goes to the search box and the caret survives the results
+        //    re-rendering underneath it.
         if let editor = controller.contentWindow.firstResponder as? NSTextView,
            !editor.hasMarkedText() {
             controller.viewModel.query = ""
@@ -8119,6 +8514,11 @@ enum SelfTest {
             print("[PANEL] quick strip typing: skipped (无字段编辑器)")
         }
 
+        // 8. The note editor: while it is open the page stays up, and Return
+        //    belongs to the field (the routing rule) rather than to "copy".
+        //    The live esc check needs the panel to be the key window, which a
+        //    CLI process is not guaranteed to get; it reports a skip instead of
+        //    pretending to have verified it.
         if let first = cardIDs.first, let clip = store.clip(id: first) {
             controller.viewModel.select(clip)
             controller.viewModel.openNoteEditor(clip)
@@ -8155,6 +8555,7 @@ enum SelfTest {
             }
         }
 
+        // 9. A show() during the hide animation still leaves the panel up.
         controller.hide()
         controller.show()
         RunLoop.main.run(until: Date().addingTimeInterval(0.6))
@@ -8175,6 +8576,7 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+    /// Clicks at a point expressed in the pane's top-down coordinates.
     @MainActor
     private static func sendClick(
         at point: NSPoint,
@@ -8197,6 +8599,7 @@ enum SelfTest {
         }
     }
 
+    /// Sends one key press to a window (what the controller's monitor sees).
     @MainActor
     private static func sendKey(keyCode: UInt16, to window: NSWindow) {
         NSApp.sendEvent(
@@ -8215,6 +8618,8 @@ enum SelfTest {
         )
     }
 
+    /// `--panel-retention-probe`: the panel must release the workspace it was
+    /// switched away from, and releasing the view must release the view model.
     @MainActor
     static func panelRetentionProbe() -> Int32 {
         var failures = 0
@@ -8239,6 +8644,7 @@ enum SelfTest {
             return ClipStore(baseDirectory: dir, settingsStore: settings)
         }
 
+        // A view model plus its host view, dropped together.
         weak var weakModel: PanelViewModel?
         weak var weakBoundStore: ClipStore?
         do {
@@ -8246,7 +8652,9 @@ enum SelfTest {
             weakBoundStore = store
             let model = PanelViewModel(store: store)
             weakModel = model
-
+            // An explicit pool: a hosting view handed to the autorelease pool
+            // keeps its view model alive until the pool drains, which made the
+            // first version of this probe report a leak that was not there.
             autoreleasepool {
                 let hosting = NSHostingView(rootView: QuickStripView(vm: model))
                 hosting.frame = NSRect(x: 0, y: 0, width: 900, height: 306)
@@ -8258,7 +8666,8 @@ enum SelfTest {
                     + " store=" + (weakBoundStore == nil ? "已释放" : "仍存活")
             )
         }
-
+        // Let the view model's first-paint task finish before judging its
+        // lifetime: it holds a reference until it publishes.
         RunLoop.main.run(until: Date().addingTimeInterval(0.6))
         expect(weakModel == nil, "宿主视图释放后 view model 也释放")
         expect(weakBoundStore == nil, "view model 释放后它持有的 store 也释放")
@@ -8268,6 +8677,7 @@ enum SelfTest {
                 + " store=" + (weakBoundStore == nil ? "已释放" : "仍存活")
         )
 
+        // Rebinding keeps the panel and releases the workspace it left.
         let panel = QuickStripController(
             viewModel: PanelViewModel(store: makeStore("first"))
         )
@@ -8283,6 +8693,10 @@ enum SelfTest {
         expect(oldStore == nil, "rebind 之后旧工作区被释放")
         expect(panel.viewModel.store === second, "rebind 之后模型指向新工作区")
 
+        // A workspace switch swaps `ClipStore.shared`, and the panel must
+        // follow it without the switcher having to call `rebind` — the
+        // shipped bug was exactly that forgotten call: the page kept showing
+        // the previous workspace while captures went to the new one.
         let sharedBefore = ClipStore.shared
         let third = makeStore("third")
         ClipStore.replaceShared(with: third)
@@ -8306,6 +8720,8 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+    /// `--panel-memory-probe [--dir …]`: switching workspaces repeatedly must
+    /// not accumulate rows or keep the previous store resident.
     @MainActor
     static func panelMemoryProbe(directory: URL?) -> Int32 {
         var failures = 0
@@ -8372,6 +8788,10 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+    /// `--compare-probe`: the search engine's fast path against a brute-force
+    /// scan of the same store. (This used to compare the local result against
+    /// the AI plan's result; with the AI path gone, the useful equivalence is
+    /// "fast path == scanning every row".)
     @MainActor
     static func compareProbe() -> Int32 {
         var failures = 0
@@ -8428,7 +8848,8 @@ enum SelfTest {
             )
             if !parity { failures += 1 }
         }
-
+        // "json" is not a text keyword: the planner maps it to the JSON smart
+        // tag, so it is checked against the tag rather than against a substring.
         let tagged = engine.search(
             query: "json",
             filter: SearchFilter(),
@@ -8452,6 +8873,9 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+    /// `--capture-evaluate`: the capture pipeline against isolated pasteboards —
+    /// text, image, a source app that marked its own content confidential, and
+    /// sensitive-looking text when "skip sensitive" is on.
     @MainActor
     static func captureEvaluateProbe() -> Int32 {
         var failures = 0
@@ -8531,7 +8955,8 @@ enum SelfTest {
             Data("1".utf8),
             forType: NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
         )
-
+        // A bundle id that is *not* on the password-manager list: otherwise the
+        // ignore-list rule fires first and this would assert the wrong gate.
         let concealedDecision = evaluate(
             concealed,
             front: "com.example.secret-tool",
@@ -8576,6 +9001,8 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+    /// `--classification-perf`: the classifier's accuracy on a labelled corpus
+    /// and its cost on a long document.
     @MainActor
     static func classificationPerfProbe() -> Int32 {
         var failures = 0
@@ -8609,6 +9036,11 @@ enum SelfTest {
         )
         if correct != corpus.count { failures += 1 }
 
+        // A long document must classify in one pass and keep its length: the
+        // classifier used to truncate before looking at the structure. The
+        // sample is deliberately modest — the classifier is regex-based, and a
+        // 100k-character document takes minutes (which this probe would rather
+        // report as a number than hang on).
         let long = String(repeating: "apiVersion: v1\nkind: Pod\n", count: 200)
         let longStart = Date()
         let longTag = ClassificationEngine.classify(long) ?? .text
@@ -8628,6 +9060,14 @@ enum SelfTest {
         return failures == 0 ? 0 : 1
     }
 
+/// Minimal loopback TCP listener that counts accepted connections.
+///
+/// The self-test uses it to prove that decoding clipboard HTML does not reach
+/// the network. Asserting on the sanitized string alone could pass while the
+/// importer still fetched something, so the check is anchored on a real
+/// socket — with a positive control that the probe does observe connections.
+/// Plain BSD sockets: no extra framework, no privileged port, no external
+/// traffic.
 final class LoopbackConnectionProbe: @unchecked Sendable {
     private var listenFD: Int32 = -1
     private var thread: Thread?

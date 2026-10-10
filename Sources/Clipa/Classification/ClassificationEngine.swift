@@ -14,6 +14,8 @@ enum ClassificationReason: Sendable, Equatable {
     case yamlDocumentMarker
     case kubernetesStructure
 
+    /// Penalty signals that stop structured formats from claiming log-shaped
+    /// or prose-shaped text.
     case timestamp
     case decodeFailure
     case exception
@@ -22,9 +24,13 @@ enum ClassificationReason: Sendable, Equatable {
 
     case strictJSON
 
+    /// Structure that argues for the *other* format: `#` headings read as
+    /// Markdown headings, or a wall of `key: value` mappings read as YAML.
     case markdownStructure
     case yamlMapping
 
+    /// YAML accepted on structural evidence because the subset parser could not
+    /// validate it (Kubernetes manifests, CI configuration, templates).
     case structuralFallback
 
     case custom(String)
@@ -55,9 +61,10 @@ struct ClassificationContext: Sendable {
     let lineCount: Int
     let nonEmptyLineCount: Int
     let characterCount: Int
-
+    /// `#`…`######` followed by text — Markdown headings, which YAML would
+    /// otherwise read as comments.
     let atxHeadingCount: Int
-
+    /// Lines opening a YAML mapping (`key:` / `key: value`), comments excluded.
     let mappingLineCount: Int
     let textFeatures: TextFeatures
 
@@ -96,6 +103,15 @@ struct ClassificationContext: Sendable {
         )
     }
 
+    /// Cheap `key:` / `key: value` test used only to tell YAML-dominant text
+    /// from heading-dominant text.
+    ///
+    /// P1 修复（2026-10-02）：与 `YAMLFeatureDetector.mappingLineRegex`
+    /// （`^\s*[\p{L}\p{N}_.-]+\s*:(?:\s.*)?$`）语义对齐——冒号后必须是
+    /// **行尾或空白**。旧版只看冒号前的 key，`https://a.com` 的 key 是
+    /// "https"、后面跟着 "//a.com"，也被当成映射行；两行 URL + 两行键值
+    /// 就能凑出 0.70 的 YAML 分越过 0.50 阈值。两版必须一致：它们共同喂给
+    /// YAML 打分与 Markdown 惩罚。
     static func isMappingLine(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         guard let colon = trimmed.firstIndex(of: ":") else { return false }
@@ -110,8 +126,16 @@ struct ClassificationContext: Sendable {
     }
 }
 
+/// YAML 的**形状校验**（2026-09-30）：自带的 704 行子集解析器 `YAMLSubset`
+/// 随"精简解析器"一并移除，改用行级结构检查回答同一个问题——
+/// "这段文本能不能如实当作 YAML 块来标注"。
+///
+/// 它不是解析器：块标量的续行、锚点引用的展开仍可能看走眼。看不准时
+/// 交给原有的结构回退（k8s 结构 / 映射行密度），两道都不过就不标 ——
+/// 把 YAML 误标成文本，永远比把文本误标成 YAML 便宜。
 private enum YAMLShape {
-
+    /// 每个有内容的行都必须是映射行、序列项、注释或文档标记，且至少要有
+    /// 一行结构 —— 全部满足才算"能按块 YAML 理解"。
     static func looksLikeParsableBlock(_ text: String) -> Bool {
         var sawStructure = false
         for rawLine in text.split(
@@ -137,6 +161,9 @@ private enum YAMLShape {
         return sawStructure
     }
 
+    /// 会改变 YAML 语义而这套检查不支持的构造：锚点/别名（`&`/`*`）、
+    /// 标签（`!`）、合并键（`<<:`）、多文档。形状像 YAML 且带这些构造的
+    /// 文本由调用方走"形状支持不了 + 两个结构信号"的既有路径。
     static func hasUnsupportedConstructs(_ text: String) -> Bool {
         var documentMarkers = 0
         for rawLine in text.split(separator: "\n") {
@@ -221,7 +248,8 @@ enum ClassificationResolver {
 }
 
 private enum TextFeatureExtractor {
-
+    /// Matched anywhere in the text with `anchorsMatchLines`, so "some line
+    /// starts with a timestamp" is a single pass instead of one regex per line.
     private static let timestampRegex = try? NSRegularExpression(
         pattern: #"^\[?(?:\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?|\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?|\d{2}:\d{2}:\d{2}(?:\.\d+)?|[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})"#,
         options: [.anchorsMatchLines]
@@ -280,19 +308,27 @@ private enum TextFeatureExtractor {
 private struct JSONClassifier: ContentClassifier {
     let tag: SmartTag = .json
 
+    /// Parsing the whole document is what makes large JSON recognizable, but
+    /// the cost has to stay bounded; anything beyond this is left to the
+    /// sampled heuristics.
     private static let maxParseBytes = 8 * 1024 * 1024
 
     func classify(
         _ context: ClassificationContext
     ) -> ClassificationResult? {
-
+        // The context samples the first 100k characters for the structural
+        // heuristics, and a truncated prefix of a large JSON file never parses
+        // — which is why every JSON over 100k was previously filed as text.
+        // Strict parsing needs the complete document.
         let text = context.originalText
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         guard text.hasPrefix("{") || text.hasPrefix("[") else { return nil }
         guard text.utf8.count <= Self.maxParseBytes else { return nil }
-
+        // 校验交给 Foundation 的 JSONSerialization：系统实现、同样严格，
+        // 替代原先自带的 JSONTree 子集解析器（2026-09-30 随"精简解析器"移除）。
+        // 前缀已保证顶层是容器，命中的必然是字典或数组，不存在碎片歧义。
         guard let object = try? JSONSerialization.jsonObject(
                   with: Data(text.utf8)
               ),
@@ -322,6 +358,12 @@ private struct YAMLClassifier: ContentClassifier {
             parseable
             || (unsupportedShaped && features.structuralSignalCount >= 2)
 
+        // Structural fallback. The subset parser rejects plenty of real-world
+        // YAML — Kubernetes manifests and CI configuration among them — and
+        // those files are neither parser-validated nor "shaped but
+        // unsupported", so they used to be filed as plain text. Accept them
+        // when the structure is unmistakable, with prose and Markdown ruled
+        // out first.
         let firstMeaningful = context.nonEmptyLines.first {
             !$0.hasPrefix("#")
         }
@@ -338,7 +380,10 @@ private struct YAMLClassifier: ContentClassifier {
             )
             && !context.textFeatures.hasNaturalLanguage
             && !features.hasChineseProsePairs
-
+            // Headings block the fallback only when they *dominate* the
+            // document. A config file with a handful of `#` comment headings
+            // still has far more mappings than headings; an absolute threshold
+            // rejected those outright (25 of 37 remaining cases).
             && !(context.atxHeadingCount >= 3
                  && context.atxHeadingCount * 2 >= context.mappingLineCount)
         let usedStructuralFallback = !parserValidated && structurallyYAML
@@ -385,6 +430,7 @@ private struct YAMLClassifier: ContentClassifier {
             reasons.append(.kubernetesStructure)
         }
 
+        // Parser validation is represented by enough structural signals here.
         if features.structuralSignalCount >= 2 {
             score += 0.15
             reasons.append(.parserValidated)
@@ -395,7 +441,14 @@ private struct YAMLClassifier: ContentClassifier {
             score -= 0.15
             reasons.append(.timestamp)
         }
-
+        // Heading-dominant text is Markdown: a document whose `#` lines
+        // outnumber its mappings is a README, not a YAML file with comments.
+        // Measured on real repository files: Markdown read as YAML had ~36
+        // headings vs ~21 mappings, while correctly-classified YAML had ~2 vs ~26.
+        // Only when the subset parser could NOT validate the text. A file the
+        // parser did parse is YAML no matter how many `#` comment banners it
+        // carries — 13 otherwise-correct files were knocked below Markdown by
+        // this penalty, while only 3 of 333 Markdown samples are parseable.
         if !parseable,
            context.atxHeadingCount >= 5,
            Double(context.atxHeadingCount)
@@ -522,7 +575,10 @@ private struct MarkdownClassifier: ContentClassifier {
         }
 
         let hasHeading = headingCount > 0
-
+        // P1 修复（2026-10-02）：`linkCount > 0` 从"一票通过项"移除——正文中
+        // 出现**一个**链接是普通句子的常态，不该单凭它就把整段判成 Markdown
+        // （链接权重恰好 0.40、及格线也恰好 0.40，轻重颠倒：单个 ATX 标题
+        // 反而不够）。链接降为普通加分项，见下。
         let hasStrongStructure =
             codeFenceCount >= 2
             || tableCount > 0
@@ -552,7 +608,8 @@ private struct MarkdownClassifier: ContentClassifier {
             score += blockquoteCount >= 2 ? 0.40 : 0.20
         }
         if linkCount > 0 {
-
+            // 0.15：标题(0.25)+链接(0.15) 恰好过线——"一行标题带一个链接"
+            // 是 README 片段的常态；而裸链接配不上独立达标。
             score += 0.15
         }
         if boldCount > 0 {
@@ -564,7 +621,10 @@ private struct MarkdownClassifier: ContentClassifier {
         if lines.first == "---" && lines.dropFirst().contains("---") {
             score += 0.20
         }
-
+        // A wall of `key: value` with no headings is a config file that happens
+        // to contain bullet-like lines, not a Markdown document. Measured on
+        // real repositories: YAML read as Markdown had ~33 mappings vs ~0
+        // headings, while correctly-classified Markdown had ~0 mappings.
         if context.mappingLineCount >= 5,
            Double(context.mappingLineCount)
             > Double(context.atxHeadingCount) * 3 {
@@ -632,6 +692,8 @@ private enum YAMLFeatureDetector {
             lowercasedKeys.contains("apiversion")
             && lowercasedKeys.contains("kind")
 
+        // `lines` is empty for whitespace-only text (the trimmer removes the
+        // single blank line), and `1..<0` is a trap rather than an empty range.
         let nested = lines.count >= 2 && (1..<lines.count).contains { index in
             let previous = lines[index - 1]
             let current = lines[index]

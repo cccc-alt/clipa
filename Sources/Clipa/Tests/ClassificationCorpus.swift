@@ -218,6 +218,11 @@ enum ClassificationCorpus {
         """#, expectedTag: nil, kind: .text)
     ]
 
+    /// Formerly first-class types that the 2026-09-11 taxonomy retires: log,
+    /// URL, IP, email and shell command. They are now expected to be plain
+    /// text (`expectedTag: nil`), and these cases double as false-positive
+    /// guards proving the surviving JSON/YAML/Markdown detectors do not claim
+    /// them.
     private static let logShapedCases: [ClassificationTestCase] = [
         .init(id: "LOG-01", text: "2026-09-06 10:00:01 INFO server started\n2026-09-06 10:00:02 INFO listening on port 8080", expectedTag: nil, kind: .text),
         .init(id: "LOG-02", text: "2026-09-06 10:01:23 ERROR connection refused", expectedTag: nil, kind: .text),
@@ -257,7 +262,9 @@ enum ClassificationCorpus {
         .init(id: "URL-13", text: "mailto:admin@example.com", expectedTag: nil, kind: .text),
         .init(id: "URL-14", text: "https://kubernetes.default.svc/api/v1/namespaces/default/pods", expectedTag: nil, kind: .text),
         .init(id: "URL-15", text: "2026-09-06 10:20:01 INFO GET https://api.example.com/v1/users", expectedTag: nil, kind: .text),
-
+        // 回归（2026-10-02 isMappingLine 统一）：URL 行的 "https:" 冒号前是
+        // 合法 key——旧版把它当映射行，两行 URL + 两行键值凑出 0.70 越过
+        // YAML 阈值。修复后 URL 行不再计数，这样的文本不得标 YAML。
         .init(id: "URL-16", text: "https://github.com/aaa/bbb\nhttps://github.com/ccc/ddd\nname: nginx\nreplicas: 3", expectedTag: nil, kind: .text)
     ]
 
@@ -343,6 +350,9 @@ enum ClassificationCorpus {
         .init(id: "CMD-19", text: #"node -e "console.log(1)""#, expectedTag: nil, kind: .text)
     ]
 
+    /// Real-world YAML the subset parser rejects. Kubernetes manifests and CI
+    /// configuration are neither parser-validated nor "shaped but
+    /// unsupported", so they used to fall through to text.
     private static let realWorldYAMLCases: [ClassificationTestCase] = [
         .init(id: "RWY-01", text: #"""
         apiVersion: network.networkconfigoperator/v1
@@ -394,7 +404,7 @@ enum ClassificationCorpus {
         build:
           builder: custom
         """#, expectedTag: .yaml, kind: .text),
-
+        // Guards: prose and logs must not be swept up by the fallback.
         .init(id: "RWY-04", text: "结论: 成功\n原因: 网络正常\n备注: 无需处理\n结果: 通过", expectedTag: nil, kind: .text),
         .init(id: "RWY-05", text: "2026-09-11 10:00:01 ERROR connect failed\n2026-09-11 10:00:02 ERROR retry\n2026-09-11 10:00:03 INFO done", expectedTag: nil, kind: .text),
         .init(id: "RWY-06", text: "今天做了三件事 - 吃饭 - 睡觉 - 写代码，没有列表结构。\n第二行也是散文，只是提到 x: 1 这样的写法而已。", expectedTag: nil, kind: .text)
@@ -405,7 +415,9 @@ enum ClassificationCorpus {
         .init(id: "MD-02", text: "## Heading\n\n```bash\necho hi\n```\n\n```json\n{}\n```", expectedTag: .markdown, kind: .text),
         .init(id: "MD-03", text: "| Name | Value |\n| --- | --- |\n| a | 1 |", expectedTag: .markdown, kind: .text),
         .init(id: "MD-04", text: "# 备注\n\n**重点** 见 [文档](https://example.com)", expectedTag: .markdown, kind: .text),
-
+        // 回归（2026-10-02 链接降级）：单个链接是普通句子的常态——旧版链接
+        // 权重 0.40 恰好等于及格线，一句带链接的话就被判成 Markdown。
+        // 修复后链接是普通加分项，必须有标题/列表等硬结构才达标。
         .init(id: "MD-05", text: "详情见 [文档](https://example.com)，有问题随时联系。", expectedTag: nil, kind: .text)
     ]
 

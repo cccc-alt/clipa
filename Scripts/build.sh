@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-VERSION="1.0.0"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Support/Info.plist)"
 APP_NAME="Clipa"
 BUILD_DIR=".build/app"
 STAGE_DIR=".build/dmg-staging"
 ICONSET="$BUILD_DIR/AppIcon.iconset"
 
 echo "==> 清理旧构建"
-rm -rf "$BUILD_DIR" "$STAGE_DIR" dist
+rm -rf "$BUILD_DIR" "$STAGE_DIR"
 mkdir -p "$BUILD_DIR/$APP_NAME.app/Contents/MacOS"
 mkdir -p "$BUILD_DIR/$APP_NAME.app/Contents/Resources"
 mkdir -p "$ICONSET"
@@ -61,10 +61,6 @@ iconutil -c icns "$ICONSET" -o "$BUILD_DIR/$APP_NAME.app/Contents/Resources/AppI
 
 echo "==> 组装 App"
 cp Support/Info.plist "$BUILD_DIR/$APP_NAME.app/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" \
-    "$BUILD_DIR/$APP_NAME.app/Contents/Info.plist" >/dev/null
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion 15" \
-    "$BUILD_DIR/$APP_NAME.app/Contents/Info.plist" >/dev/null
 
 echo "==> 组装 CLI 助手（clipa）"
 # `clipa` 是主二进制的一个**副本**：以这个名字被调用时，它走 CLI 客户端分支，
@@ -89,6 +85,13 @@ echo "==> 制作 DMG"
 mkdir -p "$STAGE_DIR"
 cp -R "$BUILD_DIR/$APP_NAME.app" "$STAGE_DIR/"
 cp README.md "$STAGE_DIR/使用说明.md"
+if [[ -f CHANGELOG.md ]]; then
+    cp CHANGELOG.md "$STAGE_DIR/更新说明.md"
+fi
+if [[ -f LICENSE ]]; then
+    cp LICENSE "$STAGE_DIR/LICENSE"
+fi
+cp Vendor/SQLCipher/LICENSE.md "$STAGE_DIR/SQLCipher-LICENSE.md"
 ln -s /Applications "$STAGE_DIR/Applications"
 
 hdiutil create \

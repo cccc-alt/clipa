@@ -1,6 +1,15 @@
 import AppKit
 import Foundation
 
+// Real-environment checks for:
+// 1. 自动忽略密码管理器（按来源应用 bundle id）
+// 2. 自动跳过敏感内容（sk- / AKIA / ghp_ / xoxb / Bearer / PEM）
+// 3. 应用自报的机密标记（org.nspasteboard.ConcealedType / TransientType）
+//
+// Uses a real NSPasteboard object (isolated name, not the user's general
+// pasteboard), an isolated UserDefaults suite and a temporary ClipStore, so
+// the checks exercise the genuine capture pipeline without touching live data.
+
 var passed = 0
 var failed = 0
 var failures: [String] = []
@@ -32,7 +41,8 @@ func pasteboard(text: String, markers: [String] = []) -> NSPasteboard {
     pb.clearContents()
     pb.setString(text, forType: .string)
     for marker in markers {
-
+        // Apps publish the marker as its own flavor, alongside the payload the
+        // user would actually paste.
         pb.setData(
             Data(marker.utf8),
             forType: NSPasteboard.PasteboardType(marker)
@@ -62,6 +72,8 @@ func decide(
         store: store
     )
 }
+
+// MARK: - 自动忽略密码管理器
 
 for bundleID in SettingsStore.defaultPasswordManagerBundleIDs {
     let decision = decide(
@@ -103,6 +115,8 @@ if case .captured = terminalDecision {
     check("普通应用不受密码管理器忽略影响", false, detail: String(describing: terminalDecision))
 }
 
+// MARK: - 自动跳过敏感内容
+
 let sensitiveSamples = [
     "sk-" + "0123456789abcdef0123456789abcdef",
     "AKIA" + "IOSFODNN7EXAMPLE",
@@ -113,20 +127,23 @@ let sensitiveSamples = [
     "password: hunter2hunter2",
     "api_key=abcdefgh123456",
     "密钥：abcdefgh1234567890",
-
+    // Categories only the extended rules know about: the skip gate has to use
+    // the same predicate as the stored marker, or these reach the history.
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r",
     "postgres://admin:S3cret@db.internal:5432/app",
     "mongodb+srv://svc:Pa55w0rd@cluster0.example.net/db",
     "redis://default:foobared@cache.internal:6379",
     "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\n-----END OPENSSH PRIVATE KEY-----",
     #"{"password": "hunter2hunter2"}"#,
-
+    // P0 boundary: crypt hashes start with `$` and must survive the
+    // reference/template downgrade.
     "password: $6$i3/J6tE.gh$ccHhabK2FsPT2U2OwMDiFZSPL7L18K",
     "password: $y$j9T$21VgKI4Ug8Q/odUe/Tne31$6.0V1o7A4OJEjI8zXw9",
     "password: $0$admin",
     #"password: abc${REF}xyz123"#
 ]
 
+// Values that only point at a credential: recorded normally, never skipped.
 let referenceSamples = [
     "password: ${DB_PASSWORD}",
     "password: ${DB_PASSWORD:-}",
@@ -192,6 +209,11 @@ if case .captured = normalDecision {
     check("普通内容不被敏感规则误杀", false, detail: String(describing: normalDecision))
 }
 
+// MARK: - 应用自报的机密标记
+
+// 本组的重点是「名单之外的来源」：一个从没被列进任何忽略名单的工具，复制一个
+// 没有 password / token 字样的随机密码。以前它会被完整记录、且不带任何敏感
+// 提示（纯随机串命不中凭证规则）；现在必须整条丢弃。
 let concealedType = "org.nspasteboard.ConcealedType"
 let transientType = "org.nspasteboard.TransientType"
 
@@ -219,6 +241,8 @@ check(
     detail: String(describing: transientCopy)
 )
 
+// 同一个来源、同类内容，只是没带标记：仍然正常记录。标记不能退化成
+// 「这个 App 的内容全部丢弃」。
 let unmarkedSameApp = decide(
     "Xk7m2Qp9vT4w9Zq",
     from: "com.example.internal-secret-tool",
@@ -234,6 +258,7 @@ if case .captured(let item) = unmarkedSameApp {
     )
 }
 
+// 图片 + 机密标记：判定看的是类型表，与内容形态无关。
 let sealedImagePB = NSPasteboard(
     name: NSPasteboard.Name("ClipaFilterImage-\(UUID().uuidString)")
 )
@@ -262,6 +287,7 @@ check(
     detail: String(describing: sealedImage)
 )
 
+// 开关关闭后恢复旧行为——用户能自己验证这条标记到底做了什么。
 let optedOut = decide(
     "Xk7m2Qp9vT4w9Zq",
     from: "com.example.internal-secret-tool",
@@ -278,6 +304,8 @@ if case .captured(let item) = optedOut {
         detail: String(describing: optedOut)
     )
 }
+
+// MARK: - 汇总
 
 try? FileManager.default.removeItem(at: storeDir)
 defaults.removePersistentDomain(forName: suiteName)

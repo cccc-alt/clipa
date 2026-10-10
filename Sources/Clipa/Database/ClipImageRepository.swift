@@ -1,8 +1,17 @@
 import Foundation
 import CSQLCipher
 
+/// Image bytes for image clips.
+///
+/// They live in `clip_images`, keyed by the owning `clips.db_id`, instead of
+/// inline in `clips`. Inline blobs made every scan of `clips` walk the whole
+/// file — SQLite follows each row's overflow chain to reach the next row — so
+/// loading the row list of a 10GB library cost 6.1s instead of 0.34s. Keeping
+/// the bytes in the same database file (just another table) preserves the
+/// single-transaction / single-backup property.
 enum ClipImageRepository {
-
+    /// Set once every inline blob has been moved.
+    /// Set once the file has been compacted after the move.
     static let compactedMarkerKey = "images.compacted_after_move"
 
     static func store(
@@ -32,6 +41,7 @@ enum ClipImageRepository {
         }
     }
 
+    /// Cheap availability probe: never transfers the blob itself.
     static func hasData(
         dbID: Int64,
         connection: DatabaseConnection
@@ -56,6 +66,12 @@ enum ClipImageRepository {
         }
     }
 
+    // MARK: - v10 move
+
+    /// Image rows whose bytes are still inline in `clips`.
+    ///
+    /// `kind = 3` is what keeps this cheap: the kind index visits only image
+    /// rows instead of walking the whole (multi-gigabyte) table.
     static func pendingInlineImageIDs(
         connection: DatabaseConnection,
         limit: Int
@@ -90,6 +106,11 @@ enum ClipImageRepository {
         return try connection.scalarInt(sql)
     }
 
+    /// Copies one row's bytes into `clip_images` and clears the inline column
+    /// so the row is never processed twice.
+    ///
+    /// The copy happens inside SQLite (`INSERT ... SELECT`), so a 20MB image
+    /// never becomes a 20MB Swift `Data` on the way across.
     static func moveInlineImage(
         dbID: Int64,
         connection: DatabaseConnection

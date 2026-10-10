@@ -2,6 +2,10 @@ import AppKit
 import Darwin
 import Foundation
 
+/// `clipa` 客户端：把一个请求写到 socket、读回一个响应、打印出来。
+///
+/// 它**不读数据库、不判策略、不认识私密标记** —— 所有策略都在应用进程里，CLI 只是一根
+/// 管子。它长得这么短是有意的：多一件事在这里做，就多一份会和应用漂移的策略。
 enum APIClientCLI {
     static let usage = """
     用法：clipa <动词> [参数]
@@ -35,12 +39,14 @@ enum APIClientCLI {
       4 被策略拒绝         5 协议版本不一致
     """
 
+    // MARK: - 入口
+
     static func run(arguments: [String]) -> Int32 {
         if arguments.contains("--help") || arguments.first == "help" {
             print(usage)
             return 0
         }
-
+        // P3 修复（2026-10-03）：Options 只解析一次（原来 run 与 invoke 各一遍）。
         guard let options = Options(arguments: arguments),
               let outcome = invoke(parsed: options) else {
             FileHandle.standardError.write(Data((usage + "\n").utf8))
@@ -49,6 +55,8 @@ enum APIClientCLI {
         return report(outcome.response, options: options)
     }
 
+    /// 发一个请求、拿回响应与退出码，**不打印**。MCP 薄壳复用这一条路 ——
+    /// 令牌解析、拉起应用、超时语义与 CLI 是同一份，不存在第二套会漂移的实现。
     static func invoke(
         arguments: [String]
     ) -> (response: APIResponse, exitCode: Int32)? {
@@ -56,6 +64,8 @@ enum APIClientCLI {
         return invoke(parsed: parsed)
     }
 
+    /// P3 修复（2026-10-03）：拆出"用已解析的选项发请求"——`run` 与薄壳各
+    /// 解析一遍 Options 的重复消失，两处仍是同一条管道。
     static func invoke(
         parsed: Options
     ) -> (response: APIResponse, exitCode: Int32)? {
@@ -66,7 +76,8 @@ enum APIClientCLI {
         let url = APIControlServer.socketURL(
             rootDirectory: ClipStore.defaultBaseDirectory()
         )
-
+        // 先看接口在不在，再看令牌：两句提示的可操作性不同 —— 接口没开时让人去建令牌，
+        // 会把人引到错的下一步。
         if !APIControlServer.canConnect(to: url), !parsed.noLaunch,
            !Self.appIsRunning() {
             launchApp()
@@ -118,6 +129,8 @@ enum APIClientCLI {
         return (response, exitCode)
     }
 
+    // MARK: - 令牌
+
     static var tokenFileURL: URL {
         let home = FileManager.default.homeDirectoryForCurrentUser
         return home
@@ -138,6 +151,8 @@ enum APIClientCLI {
         return ""
     }
 
+    // MARK: - 传输
+
     static func send(
         _ request: APIRequest,
         to url: URL,
@@ -145,7 +160,8 @@ enum APIClientCLI {
     ) -> APIResponse? {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
-
+        // CLI 是写请求的一方：服务端若是被杀/重启，这里的 write 不能变成
+        // SIGPIPE 把 CLI 自己带走（MCP 宿主还会把它当服务器崩溃）。
         SocketProtection.disableSigPipe(fd)
         defer { close(fd) }
         var timeoutValue = timeval(
@@ -230,6 +246,10 @@ enum APIClientCLI {
         return address
     }
 
+    /// 应用在不在跑。
+    ///
+    /// 这一步是**为了别白等**：只看 socket 的话，"应用开着、但接口没开"会先盲目地
+    /// 去拉起应用再等满 5 秒才报错 —— 而那是最常见的一种失败，明明可以立刻回答。
     private static func appIsRunning() -> Bool {
         guard let identifier = Bundle.main.bundleIdentifier else { return false }
         return !NSRunningApplication
@@ -237,6 +257,7 @@ enum APIClientCLI {
             .isEmpty
     }
 
+    /// 应用没在运行时试着拉起它（**不抢焦点**：`-g`）。
     private static func launchApp() {
         let bundle = Bundle.main.bundleURL
         guard bundle.pathExtension == "app" else { return }
@@ -245,6 +266,8 @@ enum APIClientCLI {
         process.arguments = ["-g", "-a", bundle.path]
         try? process.run()
     }
+
+    // MARK: - 输出
 
     private static func report(
         _ response: APIResponse,
@@ -300,11 +323,13 @@ enum APIClientCLI {
             var lines = results.map { record in
                 let text = record.text.replacingOccurrences(of: "\n", with: " ")
                 let snippet = text.isEmpty ? "（无正文）" : String(text.prefix(80))
-
+                // 12 位（48 bit）而不是 8 位：8 位只有 32 bit，几万条时前缀碰撞就
+                // 不再可忽略——撞上不会出错（会报"有歧义"），但会平白打扰。
+                // 这段前缀现在可以**直接喂回** `get`/`copy`/`note`（见 resolve）。
                 return "\(record.id.prefix(12))  \(record.sourceApp ?? "-")"
                     + "  \(record.lastCopiedAt)  \(snippet)"
             }
-
+            // 分页提示（2026-10-01 U1）：人类可读输出不再"看起来就这些了"。
             if let total = response.total, total > results.count {
                 let start = (response.offset ?? 0) + 1
                 let end = (response.offset ?? 0) + results.count
@@ -327,6 +352,8 @@ enum APIClientCLI {
         }
         return "OK"
     }
+
+    // MARK: - 参数
 
     struct Options {
         var verb: String?
@@ -356,7 +383,9 @@ enum APIClientCLI {
             while index < rest.count {
                 let argument = rest[index]
                 func value(_ name: String) -> String? {
-
+                    // P3 修复（2026-10-03）：值必须是**下一个真实值**——
+                    // 旧实现无条件吞下一个 token，`--label --json` 会把
+                    // --json 吃成 label 内容，顺带丢掉 json 开关。
                     guard index + 1 < rest.count,
                           !rest[index + 1].hasPrefix("--") else {
                         return nil
@@ -377,7 +406,7 @@ enum APIClientCLI {
                 case "--timeout": timeout = value("--timeout").flatMap(Double.init) ?? 5
                 default:
                     if argument.hasPrefix("--") {
-
+                        // 不认识的开关：宁可报错，也不要静默忽略（脚本会以为它生效了）。
                         FileHandle.standardError.write(
                             Data("不认识的参数：\(argument)\n".utf8)
                         )
@@ -390,7 +419,9 @@ enum APIClientCLI {
             switch verb {
             case "search":
                 query = words.isEmpty ? nil : words.joined(separator: " ")
-
+                // 常见手误：把 `--limit 50` 写成 `limit 50` —— 少了横杠的参数
+                // 会被当成搜索词拼进查询，结果就是"（没有命中）"，而用户会以为
+                // 历史里没数据。宁可多说一句，也不让手误静默吞掉。
                 let knownFlags: Set<String> = [
                     "limit", "offset", "json", "token", "label",
                     "text", "note", "timeout", "no-launch", "help",
@@ -421,6 +452,7 @@ enum APIClientCLI {
             }
         }
 
+        /// `--text` 省略时读标准输入：`echo "..." | clipa put` 是最顺手的写法。
         private func readStandardInput() -> String? {
             guard isatty(STDIN_FILENO) == 0 else { return nil }
             let data = FileHandle.standardInput.readDataToEndOfFile()

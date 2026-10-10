@@ -1,13 +1,16 @@
 import AppKit
 import Foundation
 
+/// Outcome of asking "which app does the user mean by 当前应用?".
 enum IgnoreTargetResolution: Equatable {
     case resolved(bundleID: String, name: String)
-
+    /// Clipa is frontmost and no external app has been seen yet, so any answer
+    /// would be a guess. Callers must refuse instead of guessing.
     case unavailable
-
+    /// The app is known but has no bundle identifier (plain executables).
     case missingBundleID(name: String)
 
+    /// Explanation to show when nothing was added; `nil` when it worked.
     var failureMessage: String? {
         switch self {
         case .resolved:
@@ -20,8 +23,13 @@ enum IgnoreTargetResolution: Equatable {
     }
 }
 
+/// Resolves the app that "ignore the current app" refers to.
+///
+/// Pure so the rules stay testable: while Clipa's own window is frontmost (the
+/// floating panel) the answer is the last app the user was actually working in
+/// — never Clipa itself.
 enum IgnoreTargetResolver {
-
+    /// The two facts the decision needs about an app.
     struct Candidate: Equatable {
         let bundleID: String?
         let name: String?
@@ -63,7 +71,8 @@ enum IgnoreTargetResolver {
                 )
             }
         }
-
+        // Clipa itself is frontmost (or nothing is): fall back to the last app
+        // the user actually worked in.
         guard let lastExternal,
               let bundleID = BundleIDNormalizer.normalize(
                   lastExternal.bundleID ?? ""
@@ -80,7 +89,11 @@ enum IgnoreTargetResolver {
 
 @MainActor
 enum IgnoreTargetActions {
-
+    /// The app "忽略当前前台应用" means *right now*, or why there is no answer.
+    ///
+    /// The caller resolves once and renders the result into the menu item, then
+    /// adds the bundle id that item carries. Resolving twice — once to label,
+    /// once to act — would let the label and the effect disagree.
     static func currentTarget() -> IgnoreTargetResolution {
         IgnoreTargetResolver.resolve(
             frontmost: NSWorkspace.shared.frontmostApplication,
@@ -88,6 +101,8 @@ enum IgnoreTargetActions {
         )
     }
 
+    /// Adds one bundle id, normalized and deduplicated. Returns `false` when
+    /// the id was empty or already on the list.
     @discardableResult
     static func add(
         bundleID rawBundleID: String,
@@ -101,12 +116,15 @@ enum IgnoreTargetActions {
         return true
     }
 
+    /// What a batch add (the "choose application…" panel) produced.
     struct BatchResult: Equatable {
         var added: [String] = []
         var alreadyListed: [String] = []
         var unusable: [String] = []
     }
 
+    /// Adds every picked app bundle. Bundles without a bundle identifier (plain
+    /// executables, broken bundles) are reported instead of silently ignored.
     @discardableResult
     static func addApplications(
         at urls: [URL],
@@ -130,6 +148,15 @@ enum IgnoreTargetActions {
     }
 }
 
+/// What the 忽略与跳过 line says, and whether it can be clicked at all.
+///
+/// Pure so the wording is pinned by tests instead of by the menu: the previous
+/// item was always clickable and always answered "已忽略 X", including when X was
+/// already on the list and nothing had changed — a claim rather than a fact.
+/// Now an app that is already ignored says so and cannot be clicked, an app that
+/// cannot be resolved explains why instead of failing silently on click, and the
+/// click acts on the bundle id this value carries, so the label and the effect
+/// cannot disagree.
 enum IgnoreTargetPresentation: Equatable {
     case actionable(title: String, bundleID: String)
     case alreadyIgnored(title: String)
@@ -166,6 +193,7 @@ enum IgnoreTargetPresentation: Equatable {
         }
     }
 
+    /// The app to add when clicked; `nil` when there is nothing to add.
     var bundleID: String? {
         guard case .actionable(_, let bundleID) = self else { return nil }
         return bundleID
@@ -173,6 +201,8 @@ enum IgnoreTargetPresentation: Equatable {
 
     var isEnabled: Bool { bundleID != nil }
 
+    /// Shown on hover. The bundle id is what the rule matches on, so it stays
+    /// readable even when two builds of an app share a name.
     var toolTip: String? {
         switch self {
         case .actionable(_, let bundleID):

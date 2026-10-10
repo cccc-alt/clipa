@@ -1,5 +1,8 @@
 import Foundation
 
+/// Local sensitive-data detection. Pure pattern matching — no network, no
+/// model. Its result is stored on the clip as `contains_sensitive`, which
+/// drives the panel's 🔐 marker and the "只看敏感内容" search filter.
 enum SensitiveDetector {
     static func containsSensitive(_ clip: Clip) -> Bool {
         containsSensitive(text: clip.text, note: clip.note)
@@ -12,11 +15,11 @@ enum SensitiveDetector {
     }
 
     private static let extraPatterns = [
-
+        // JWT
         #"eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"#,
-
+        // Database URLs with credentials
         #"(?:mysql|postgres(?:ql)?|mongodb(?:\+srv)?|redis)://[^\s:"']+:[^\s@]+@"#,
-
+        // SSH private key blocks
         #"-----BEGIN (?:OPENSSH|RSA|EC|DSA) PRIVATE KEY-----"#
     ]
     private static let extraRegexes: [NSRegularExpression] =

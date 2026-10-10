@@ -3,6 +3,14 @@ import Darwin
 import Foundation
 import ImageIO
 
+// MARK: - Process resource metrics
+
+/// Process-level CPU / memory readings for the scale benchmark.
+///
+/// `residentBytes` is what Activity Monitor calls "内存" (RSS) and
+/// `cpuNanos` is the process' cumulative user+system CPU time, so the
+/// difference over a measured window divided by the wall time gives an
+/// average CPU share of **one core** (100% == one core saturated).
 enum ScaleMetrics {
     static func residentBytes() -> UInt64 {
         var info = mach_task_basic_info()
@@ -34,6 +42,9 @@ enum ScaleMetrics {
         return UInt64(time.tv_sec) * 1_000_000_000 + UInt64(time.tv_nsec)
     }
 
+    /// Physically resident bytes, i.e. `vmmap -summary`'s "Physical footprint".
+    /// Resident size alone is misleading here: macOS keeps freed malloc pages
+    /// resident, so it stays high after a big store is released.
     static func footprintBytes() -> UInt64 {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
@@ -64,6 +75,8 @@ enum ScaleMetrics {
     static let physicalMemory = ProcessInfo.processInfo.physicalMemory
 }
 
+/// Samples RSS/CPU on a background thread so a measurement window can report
+/// the **peak** memory inside the window, not just the value at its edges.
 final class ScaleSampler {
     private struct Sample {
         let at: UInt64
@@ -118,6 +131,9 @@ final class ScaleSampler {
         lock.unlock()
     }
 
+    /// Peak RSS observed between two instants. Falls back to the closest
+    /// samples around the window so sub-interval operations still report a
+    /// real number.
     func peakRSS(from start: UInt64, to end: UInt64) -> UInt64 {
         lock.lock()
         defer { lock.unlock() }
@@ -132,14 +148,17 @@ final class ScaleSampler {
     }
 }
 
+// MARK: - Fixtures
+
 struct ScaleFixture: Codable {
     let dbID: Int64
-
+    /// `text`, `image-small` or `image-big`.
     let category: String
-
+    /// Token unique to this row, used as its search probe.
     let keyword: String
     let bytes: Int
 }
+// MARK: - Operation statistics
 
 struct ScaleOpStats {
     let name: String
@@ -282,6 +301,8 @@ final class ScaleBenchRecorder {
     }
 }
 
+// MARK: - Corpus generation + benchmark
+
 enum ScaleStressTest {
     static let sourceApp = "ClipaStress"
     private static let fixturesName = "scale-fixtures.json"
@@ -301,6 +322,8 @@ enum ScaleStressTest {
         String(format: "%.1fMB", Double(bytes) / 1_048_576)
     }
 
+    // MARK: - Load
+
     private struct LoadItem {
         let draft: NewClip
         let category: String
@@ -308,6 +331,9 @@ enum ScaleStressTest {
         let bytes: Int
     }
 
+    /// Seeds `imageCount` images (of which `bigImageCount` are ~`bigImageMegabytes`
+    /// each) plus `textCount` text clips directly through `DatabaseManager`,
+    /// bypassing `ClipStore`'s history limit and auto-pause rules.
     static func runLoad(
         directory: URL,
         imageCount: Int,
@@ -369,6 +395,7 @@ enum ScaleStressTest {
             }
         }
 
+        // Texts ------------------------------------------------------------
         for index in 0..<textCount {
             let text = textSample(index)
             let keyword = Self.textKeyword(index)
@@ -408,6 +435,7 @@ enum ScaleStressTest {
             }
         }
 
+        // Images -----------------------------------------------------------
         let bigBytes = Int(bigImageMegabytes * 1_048_576)
         let smallBytes = 48 * 1024
         for index in 0..<imageCount {
@@ -488,6 +516,8 @@ enum ScaleStressTest {
         return 0
     }
 
+    // MARK: - Bench
+
     static func runBench(
         directory: URL,
         rounds: Int,
@@ -558,11 +588,13 @@ enum ScaleStressTest {
             store.clip(dbID: fixture.dbID)
         }
 
+        // 1. Launch path: reload every row into the store + memory index.
         recorder.measure("list_load", rounds: rounds) {
             store.reloadFromDatabase()
             return !store.items.isEmpty
         }
-
+        // Same read without the store layer (dictionaries + memory index), so
+        // the two numbers separate "SQLite read" from "in-memory bookkeeping".
         await recorder.measureAsync("list_load_db_only", rounds: rounds) {
             guard let clips = try? await database.loadRecentClips() else {
                 return false
@@ -570,6 +602,7 @@ enum ScaleStressTest {
             return !clips.isEmpty
         }
 
+        // 2. Capture path: a new clip through ClipStore (policy + FTS write).
         var captureIDs: [UUID] = []
         recorder.measure("capture_insert", rounds: rounds) {
             let draft = NewClip(
@@ -582,6 +615,7 @@ enum ScaleStressTest {
             return ok
         }
 
+        // 3. Copy paths (private pasteboard, never the user's clipboard).
         recorder.measure("copy_text", rounds: rounds) {
             guard let item = clip(next(textFixtures, "copy-text")) else {
                 return false
@@ -620,6 +654,7 @@ enum ScaleStressTest {
                     || scratch.data(forType: .tiff)?.isEmpty == false)
         }
 
+        // 4. Panel preview path: read the full blob out of SQLite.
         recorder.measure("image_blob_read_big", rounds: rounds) {
             guard let item = clip(next(bigImages, "blob-big")) else {
                 return false
@@ -633,6 +668,7 @@ enum ScaleStressTest {
             return (store.imageData(for: item)?.isEmpty == false)
         }
 
+        // 5. Search paths.
         recorder.measure("search_unique_keyword", rounds: rounds) {
             let fixture = next(textFixtures, "search-unique")
             let response = engine.search(
@@ -683,13 +719,15 @@ enum ScaleStressTest {
             return response.clips.isEmpty
         }
 
+        // 7. Metadata toggles on a real row.
         let toggleFixture = textFixtures[min(5, textFixtures.count - 1)]
-
+        // Reference point: a full id scan over the public `items` array, i.e.
+        // the lookup the store performs for every single-row change.
         recorder.measure("scan_items_by_id", rounds: rounds) {
             let target = next(textFixtures, "scan").dbID
             return store.items.firstIndex { $0.dbID == target } != nil
         }
-
+        // Isolation probes for the remaining store-layer cost of one edit.
         recorder.measure("clip_lookup", rounds: rounds) {
             clip(next(textFixtures, "lookup")) != nil
         }
@@ -698,7 +736,8 @@ enum ScaleStressTest {
             store.memoryIndex.insert(clip: item)
             return true
         }
-
+        // Same write while a search snapshot is alive: the index dictionary is
+        // shared, so the mutation copies it unless the snapshot has been freed.
         recorder.measure("memory_index_write_shared", rounds: rounds) {
             let snapshot = SearchSnapshot(store: store)
             guard let item = clip(next(textFixtures, "mi-shared")) else {
@@ -722,6 +761,9 @@ enum ScaleStressTest {
             return await store.setNoteAsync(nil, for: item)
         }
 
+
+        // 9. Delete path: removes a row the capture benchmark created, so the
+        //    seeded corpus is untouched.
         recorder.measure("delete", rounds: rounds) {
             guard let id = captureIDs.popLast() else { return false }
             if case .deleted = store.delete(ids: [id]) { return true }
@@ -744,6 +786,11 @@ enum ScaleStressTest {
         return 0
     }
 
+    // MARK: - Reporting
+
+    /// Measures what a workspace switch actually does to memory: open the
+    /// big workspace, then replace it with an empty one exactly the way
+    /// `AppDelegate` does and watch the resident set.
     @MainActor
     static func runWorkspaceRetentionProbe(directory: URL) -> Int32 {
         func mb(_ bytes: UInt64) -> String {
@@ -758,7 +805,9 @@ enum ScaleStressTest {
         }
         print("")
         snapshot("baseline")
-
+        // Control: open the big store and just drop it. If the resident set
+        // stays high here, the allocator is holding freed pages rather than
+        // anything still referencing the store.
         var control: ClipStore? = ClipStore(baseDirectory: directory)
         let controlRows = control?.items.count ?? 0
         snapshot("对照：打开大工作区（\(controlRows) 行）")
@@ -817,6 +866,10 @@ enum ScaleStressTest {
         return 0
     }
 
+    /// Scores the single step everything else depends on: the query
+    /// understanding call. Sends a fixed set of representative queries to the
+    /// configured provider and checks the returned plan field by field, so a
+    /// prompt or decoder change can be measured instead of guessed at.
     static func runMemoryBreakdown(directory: URL) -> Int32 {
         func megabytes(_ bytes: UInt64) -> String {
             String(format: "%.0f", Double(bytes) / 1_048_576)
@@ -844,6 +897,8 @@ enum ScaleStressTest {
                 + " \(megabytes(afterStore))MB (\(delta(baseline, afterStore)))"
         )
 
+        // What the database holds, for contrast: image bytes are loaded on
+        // demand and are not part of the resident set.
         var textBytes = 0
         var noteBytes = 0
         var imageBytes = 0
@@ -873,6 +928,7 @@ enum ScaleStressTest {
                 + " in \(imageCount) blobs"
         )
 
+        // Preview images are cached at 1600px max and never evicted.
         var decoded: [NSImage] = []
         let imageStart = ScaleMetrics.residentBytes()
         var biggest = 0
@@ -915,6 +971,14 @@ enum ScaleStressTest {
         return 0
     }
 
+    /// Before/after numbers for the panel list windowing.
+    ///
+    /// The view used to be handed every entry in the flattened list, and that
+    /// list was rebuilt on every body evaluation. This measures both costs on
+    /// whatever store `--dir` points at.
+    ///
+    /// 这里的"每行渲染开销"一项随 JSON/YAML 互转一起删掉了（2026-09-26）：那项
+    /// 量的是行数据的解析成本，而卡片渲染现在只剩一次纯字符串截断与脱敏。
     @MainActor
     static func runPanelWindowBench(directory: URL) -> Int32 {
         let suite = "ClipaPanelWindow-\(UUID().uuidString)"
@@ -946,6 +1010,8 @@ enum ScaleStressTest {
         let entries = vm.listEntries.count
         let window = vm.renderedEntries.count
 
+        // Old shape: rebuild the flattened list the way the view did, on every
+        // body evaluation.
         var legacyEntries = 0
         let legacyStart = DispatchTime.now().uptimeNanoseconds
         for _ in 0..<3 {
@@ -958,6 +1024,7 @@ enum ScaleStressTest {
             DispatchTime.now().uptimeNanoseconds - legacyStart
         ) / 3 / 1_000_000
 
+        // New shape: copy the window out of the cached list.
         var windowEntries = 0
         let windowStart = DispatchTime.now().uptimeNanoseconds
         for _ in 0..<3 {
@@ -991,6 +1058,14 @@ enum ScaleStressTest {
         return 0
     }
 
+    /// Audits the one property the parity harness cannot see: FTS recall must
+    /// be a *superset* of the true matches.
+    ///
+    /// Parity compares the oracle and the fast path, but both narrow by the
+    /// same FTS candidate set first, so a candidate FTS dropped disappears
+    /// from both sides and the comparison still passes. This probe recomputes
+    /// the text match with a full in-memory scan (`candidateIDs == nil`) and
+    /// reports any row the engine failed to return.
     static func runSearchRecallAudit(
         directory: URL?,
         derivedProbes: Int,
@@ -1057,7 +1132,7 @@ enum ScaleStressTest {
                     store: store
                 ).clips.map(\.dbID)
             )
-
+            // The reference: same predicate, no FTS narrowing.
             let bruteIDs: Set<Int64>
             if plan.sort == .relevance {
                 bruteIDs = Set(
@@ -1205,6 +1280,8 @@ enum ScaleStressTest {
         }
     }
 
+    // MARK: - Corpus content
+
     private static func textKeyword(_ index: Int) -> String {
         String(format: "zsq%06dq", index)
     }
@@ -1222,6 +1299,9 @@ enum ScaleStressTest {
         "这段文本会重复出现在语料里，用来制造可命中的公共词。"
     ]
 
+    /// Deterministic text clip: a unique token plus realistic filler, with a
+    /// length spread so the trigram index has to handle both short and long
+    /// rows.
     static func textSample(_ index: Int) -> String {
         let keyword = textKeyword(index)
         let target = 120 + (index % 9) * 160
@@ -1234,6 +1314,10 @@ enum ScaleStressTest {
         return body
     }
 
+    /// Incompressible PNG, so the stored blob lands close to the requested
+    /// size (deflate cannot shrink random bytes). ImageIO writes
+    /// `noneSkipLast` bitmaps as 3-channel PNGs — the skipped alpha byte is
+    /// dropped — so the pixel budget is 3 bytes per pixel, not 4.
     static func makeNoisePNG(byteTarget: Int, seed: UInt64) -> Data? {
         let side = max(8, Int((Double(byteTarget) / 3.0).squareRoot()))
         let width = side

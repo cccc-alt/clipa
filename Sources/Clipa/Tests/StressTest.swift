@@ -1,6 +1,8 @@
 import AppKit
 import Foundation
 
+/// Deterministic pseudo-random source, so a stress run can be reproduced
+/// exactly (xorshift64).
 private struct StressRandom {
     private var state: UInt64
 
@@ -18,24 +20,32 @@ private struct StressRandom {
     }
 }
 
+/// One seeded row, kept so the benchmark can check recall and accuracy.
 struct StressFixture: Codable {
     let dbID: Int64
     let category: String
-
+    /// What a correct classifier must produce for this row.
     let expectedTag: String
-
+    /// Token unique to this row, used as its search query.
     let keyword: String
     let bytes: Int
     let isImage: Bool
     let isFile: Bool
 }
 
+/// Seeds a production-scale corpus into a store and benchmarks it.
+///
+/// Deliberately writes through `DatabaseManager` instead of `ClipStore`: the
+/// store applies the history limit (trimming) and the auto-pause rule, either
+/// of which would silently cap the corpus.
 enum StressTest {
     static let sourceApp = "ClipaStress"
 
     private static func fixtureURL(in directory: URL) -> URL {
         directory.appendingPathComponent("stress-fixtures.json")
     }
+
+    // MARK: - Seed
 
     static func runSeed(directory: URL, total: Int, seedValue: UInt64) -> Int32 {
         let fileManager = FileManager.default
@@ -64,6 +74,9 @@ enum StressTest {
         var fixtures: [StressFixture] = []
         var index = 0
 
+        // Composition: text 801, json 300, yaml 300, markdown 300,
+        // image 150, file 150 = 2001. Confusion rows are drawn from the
+        // existing audit corpus, 30 per structured type.
         let shape: [(String, Int, Int)] = [
             ("text", 801, 0),
             ("json", 300, 30),
@@ -95,7 +108,7 @@ enum StressTest {
 
                 let auditCases = confusion[category] ?? []
                 if isConfusion, slot < auditCases.count {
-
+                    // The audit corpus already encodes product intent.
                     let caseFile = auditCases[slot]
                     draft = NewClip(
                         kind: caseFile.kind,
@@ -105,7 +118,8 @@ enum StressTest {
                     expectedTag = caseFile.expectedTag?.rawValue ?? "text"
                     keyword = ""
                 } else if isConfusion {
-
+                    // Synthetic look-alikes fill the second half of the
+                    // confusion quota; a correct classifier calls them text.
                     let text = Self.confusionSample(
                         category,
                         index: slot,
@@ -194,7 +208,8 @@ enum StressTest {
                 }
 
                 var prepared = draft
-
+                // Unique hash: a repeated one would be treated as a duplicate
+                // touch and the corpus would never reach the target size.
                 prepared.contentHash = ContentHasher.hash(
                     text: "\(seedValue)-\(index)-\(prepared.text)"
                         + "\(prepared.imageData?.count ?? 0)"
@@ -246,6 +261,12 @@ enum StressTest {
         return 0
     }
 
+    // MARK: - Sample generators
+
+    // MARK: - Benchmark
+
+    // MARK: - Import (GitHub crawl dataset)
+
     private struct CrawlRecord: Decodable {
         struct Content: Decodable {
             let bytes: Int
@@ -258,6 +279,7 @@ enum StressTest {
         let content: Content
     }
 
+    /// Imports the crawler's `metadata.jsonl` dataset as text clips.
     static func runImport(directory: URL, datasetRoot: URL) -> Int32 {
         let manifest = datasetRoot.appendingPathComponent("metadata.jsonl")
         guard let manifestText = try? String(
@@ -338,6 +360,8 @@ enum StressTest {
         return 0
     }
 
+    /// First run of ≥6 letters/digits: a trigram index can match it, while a
+    /// string built across punctuation cannot.
     private static func searchProbe(in text: String) -> String {
         let run = text
             .split { !($0.isLetter || $0.isNumber) }
@@ -346,6 +370,8 @@ enum StressTest {
         return String(run.prefix(16))
     }
 
+    /// Recomputes classification for every fixture row and reports the accuracy
+    /// before and after, writing the new result back.
     static func runReclassify(directory: URL) -> Int32 {
         let fixtureFile = fixtureURL(in: directory)
         guard let data = try? Data(contentsOf: fixtureFile),
@@ -446,7 +472,7 @@ enum StressTest {
         let suite = "ClipaStressBench-\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suite) else { return 1 }
         let settings = SettingsStore(defaults: defaults)
-
+        // The benchmark must not trip the history limit.
         settings.historyLimit = 0
         let store = ClipStore(baseDirectory: directory, settingsStore: settings)
         guard let database = store.database else {
@@ -478,11 +504,16 @@ enum StressTest {
             let clip = store.clip(dbID: fixture.dbID)
             let key = fixture.category
 
+            // Search: 10 rounds of this row's own query. Filter-based for
+            // image/file rows, which carry no text.
             for _ in 0..<rounds {
                 let begin = DispatchTime.now().uptimeNanoseconds
                 let response: SearchResponse
                 if fixture.keyword.isEmpty, !fixture.isImage, !fixture.isFile {
-
+                    // Confusion rows carry no synthetic keyword: probe them
+                    // with their own opening text instead.
+                    // First run of ≥3 letters/digits: concatenating across
+                    // punctuation produces a string no trigram index can hold.
                     let probe = (clip?.text ?? "")
                         .split { !($0.isLetter || $0.isNumber) }
                         .first { $0.count >= 3 }
@@ -522,6 +553,8 @@ enum StressTest {
 
             guard let clip else { continue }
 
+            // Remaining product operations, each applied and reverted so the
+            // corpus is unchanged at the end of the round.
             func measure(_ name: String, _ body: () -> Bool) {
                 let begin = DispatchTime.now().uptimeNanoseconds
                 let ok = body()
@@ -568,6 +601,9 @@ enum StressTest {
                 }
             }
 
+
+            // Copy: 10 rounds, into a private pasteboard so the user's
+            // clipboard and a running Clipa are never involved.
             for _ in 0..<rounds {
                 let begin = DispatchTime.now().uptimeNanoseconds
                 let ok = ClipboardWriter.shared.copy(
@@ -579,7 +615,10 @@ enum StressTest {
                     DispatchTime.now().uptimeNanoseconds - begin
                 ) / 1_000_000
                 copyTimings[key, default: Timing()].add(ms)
-
+                // A successful write is not the same as a usable payload: the
+                // file branch once wrote only a file URL, which no text target
+                // can paste, and the call still reported success. Validate what
+                // actually landed on the pasteboard.
                 let payloadOK: Bool
                 switch clip.kind {
                 case .text:
@@ -603,6 +642,8 @@ enum StressTest {
                 }
             }
 
+            // Delete: destructive mode only, one round per row so the suite
+            // covers `rounds` independent delete measurements per category.
             if destructive, fixture.dbID % Int64(rounds) == 0 {
                 let begin = DispatchTime.now().uptimeNanoseconds
                 let outcome = store.delete(ids: [clip.id])
@@ -615,6 +656,7 @@ enum StressTest {
         }
         let elapsed = Date().timeIntervalSince(started)
 
+        // Accuracy: stored tag vs the fixture's expectation.
         var expected: [UInt64: String] = [:]
         for fixture in selected {
             expected[UInt64(bitPattern: fixture.dbID)] = fixture.expectedTag
@@ -688,6 +730,10 @@ enum StressTest {
             print("[BENCH]   mismatch \(key): \(bucket.1)/\(bucket.0)")
         }
 
+        // Safety: with the context-upload path gone, the persisted marker is
+        // what decides whether a clip counts as credential material (badge,
+        // capture gate, any future egress). It has to agree with the live rules
+        // for every seeded row, or the corpus would surface stale markers.
         let total = store.items.count
         let sensitiveMarked = store.items.filter(\.containsSensitive).count
         let markerMismatches = store.items.filter {
@@ -700,6 +746,7 @@ enum StressTest {
                 + " marker mismatches \(markerMismatches)"
         )
 
+        // Machine-readable report next to the fixtures.
         let report: [String: Any] = [
             "rows": accuracyTotal,
             "rounds": rounds,
@@ -781,6 +828,8 @@ enum StressTest {
         """
     }
 
+    /// Look-alikes that must NOT be classified as the structured format they
+    /// imitate. Derived from the pairs in `docs/format-detection-redesign.md`.
     private static func confusionSample(
         _ category: String,
         index: Int,
@@ -827,7 +876,8 @@ enum StressTest {
     }
 
     private static func imageSample(_ slot: Int, index: Int) -> (data: Data, format: String) {
-
+        // Slot 0 is the near-limit image: 30MB is the ceiling the capture
+        // pipeline enforces, so this stays just under it.
         slot == 0
             ? makeNoiseImage(width: 3_135, height: 3_135)
             : makeNoiseImage(width: 160, height: 120)
@@ -837,12 +887,13 @@ enum StressTest {
         width: Int,
         height: Int
     ) -> (data: Data, format: String) {
-
+        // Incompressible noise so the PNG lands close to its raw size.
         var random = StressRandom(seed: UInt64(width * height))
         let bytesPerRow = width * 4
         var pixels = [UInt8](repeating: 0, count: bytesPerRow * height)
         for offset in stride(from: 0, to: pixels.count, by: 4) {
-
+            // Independent channels: correlated bytes let deflate shrink the
+            // "noise", and the fixture then misses its size target.
             pixels[offset] = UInt8(truncatingIfNeeded: random.next())
             pixels[offset + 1] = UInt8(truncatingIfNeeded: random.next() >> 8)
             pixels[offset + 2] = UInt8(truncatingIfNeeded: random.next() >> 16)

@@ -1,6 +1,11 @@
 import AppKit
 import Carbon.HIToolbox
 
+/// One global hotkey definition.
+///
+/// Named and centralised so the app and the self-test agree on what is
+/// actually registered, and so a combination that collides with a system
+/// shortcut is visible in one place instead of buried in a call site.
 struct HotkeySpec: Equatable {
     let name: String
     let keyCode: Int
@@ -8,7 +13,11 @@ struct HotkeySpec: Equatable {
 }
 
 extension HotkeySpec {
-
+    /// The app's only global hotkey: ⌃⌘V opens / closes the clipboard panel.
+    ///
+    /// ⌘⇧V and ⌃V used to be registered as well; they were dropped so Clipa
+    /// takes exactly one combination away from the rest of the system (⌃V in
+    /// particular stole Control-V from every app while Clipa ran).
     static let panelToggle = HotkeySpec(
         name: "⌃⌘V",
         keyCode: kVK_ANSI_V,
@@ -16,6 +25,8 @@ extension HotkeySpec {
     )
 }
 
+/// Registers global hotkeys. Each registration gets its own id and handler, so
+/// the app could hold more than one; today it registers exactly one (⌃⌘V).
 final class GlobalHotkey {
     static let shared = GlobalHotkey()
 
@@ -24,7 +35,7 @@ final class GlobalHotkey {
         var handler: () -> Void
     }
 
-    private let signature: OSType = OSType(0x434C_5041)
+    private let signature: OSType = OSType(0x434C_5041) // 'CLPA'
     private var eventHandlerRef: EventHandlerRef?
     private var registrations: [UInt32: Registration] = [:]
     private var nextID: UInt32 = 1
@@ -41,7 +52,9 @@ final class GlobalHotkey {
                 nil,
                 &hotKey
             )
-
+            // Both halves of the identity are checked. Matching on the id alone
+            // would dispatch a hotkey that belongs to some other signature
+            // straight into this app's table.
             if status == noErr,
                hotKey.signature == GlobalHotkey.shared.signature {
                 GlobalHotkey.shared.registrations[hotKey.id]?.handler()
@@ -66,6 +79,8 @@ final class GlobalHotkey {
         }
     }
 
+    /// Registers `spec`, returning a token for `unregister(_:)` or `nil` when
+    /// the system refused it (already taken by another app).
     @discardableResult
     func register(
         spec: HotkeySpec,
@@ -91,6 +106,8 @@ final class GlobalHotkey {
         return id
     }
 
+    /// Releases a registration, so a preference that turns a shortcut off can
+    /// take effect without relaunching the app.
     func unregister(_ token: UInt32) {
         guard let registration = registrations.removeValue(forKey: token) else {
             return

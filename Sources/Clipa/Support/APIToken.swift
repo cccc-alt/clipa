@@ -1,17 +1,29 @@
 import Foundation
 import Security
+import Combine
 
+/// 本地控制面的令牌与作用域。
+///
+/// **为什么不按签名白名单**：Agent 多半跑在解释器里（python / node / shell），不是自己的
+/// 签名 app；按签名挡会把它们全挡在门外。令牌对签名与否一视同仁，而且**可归属、可撤销、
+/// 可限作用域**。调用方的签名身份仍然记录（审计里区分是谁在用），但它不是准入条件。
+///
+/// 令牌文件 `<root>/api-tokens.json`，权限 `0600`，**只存哈希**：文件被读了也拿不到
+/// 手里的令牌。完整令牌只在创建时显示一次。
 struct APIToken: Codable, Equatable, Identifiable {
     enum TokenError: LocalizedError {
         case hashFailed
+        case storageUnavailable
 
         var errorDescription: String? {
             switch self {
             case .hashFailed: return "令牌哈希计算失败"
+            case .storageUnavailable: return "令牌文件无法读取，请先修复后重试。现有文件未被覆盖。"
             }
         }
     }
 
+    /// 作用域。默认只给 meta —— 正文与写能力都要显式授权。
     enum Scope: String, Codable, CaseIterable, Sendable {
         case searchMeta = "search.meta"
         case searchText = "search.text"
@@ -33,6 +45,7 @@ struct APIToken: Codable, Equatable, Identifiable {
             }
         }
 
+        /// 写能力：默认一律不给，要勾才给。
         var isWrite: Bool {
             switch self {
             case .searchMeta, .searchText, .readFull: return false
@@ -43,9 +56,10 @@ struct APIToken: Codable, Equatable, Identifiable {
 
     let id: String
     var label: String
-
+    /// 审计与「已授权程序」里用来指代这个令牌的名字：label 是自由文本、
+    /// 允许重名（多客户端 / 轮换都会产生），**归因必须靠 id**。
     var displayName: String { "\(label)（\(id)）" }
-
+    /// 只存哈希（SHA-256 十六进制）。
     let tokenHash: String
     var scopes: [Scope]
     let createdAt: Date
@@ -67,17 +81,22 @@ struct APIToken: Codable, Equatable, Identifiable {
     }
 }
 
+/// 令牌仓库。`@MainActor`：它跟设置、菜单在同一个世界里，而 socket 侧只通过
+/// `verify(secret:)` 这一条路进来。
 @MainActor
-final class APITokenStore {
+final class APITokenStore: ObservableObject {
     static let shared = APITokenStore()
 
+    /// 测试/探针钩子：指向临时目录，绝不碰用户的真实令牌文件。
+    ///
+    /// `nonisolated(unsafe)`：它由 CLI 隔离在进程启动时设置一次，之后只读。
     nonisolated(unsafe) static var directoryOverride: URL?
 
-    private(set) var tokens: [APIToken] = []
-
+    @Published private(set) var tokens: [APIToken] = []
+    /// 使用统计的落盘节流（P3 优化 2026-10-03）：状态见 `recordUse`。
     private var lastPersistedUse: Date?
     private var pendingUsePersist = false
-    private(set) var loadError: String?
+    @Published private(set) var loadError: String?
 
     private var fileURL: URL {
         Self.url(rootDirectory: Self.directory())
@@ -92,17 +111,29 @@ final class APITokenStore {
         return ClipStore.defaultBaseDirectory()
     }
 
+    // MARK: - 读写
+
     func reload() {
-        guard let data = try? Data(contentsOf: fileURL) else {
+        let pendingStats = pendingUsePersist ? tokens : []
+        do {
+            let data = try Data(contentsOf: fileURL)
+            var loaded = try JSONDecoder().decode([APIToken].self, from: data)
+            for index in loaded.indices {
+                guard let pending = pendingStats.first(where: { $0.id == loaded[index].id && $0.tokenHash == loaded[index].tokenHash }) else { continue }
+                loaded[index].callCount = max(loaded[index].callCount, pending.callCount)
+                if let used = pending.lastUsedAt, used > (loaded[index].lastUsedAt ?? .distantPast) {
+                    loaded[index].lastUsedAt = used
+                }
+            }
+            tokens = loaded
+            loadError = nil
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+            [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code) {
             tokens = []
             loadError = nil
-            return
-        }
-        do {
-            tokens = try JSONDecoder().decode([APIToken].self, from: data)
-            loadError = nil
         } catch {
-
+            // 读坏了**不能**当作"没有令牌"就放行——那样最坏情况是全部拒绝，
+            // 但把文件读成空会让"撤销过的令牌"看起来还在。
             tokens = []
             loadError = "令牌文件无法解析：\(error.localizedDescription)"
             NSLog("Clipa token file unreadable: \(error.localizedDescription)")
@@ -110,24 +141,32 @@ final class APITokenStore {
     }
 
     private func save() throws {
+        guard loadError == nil else { throw APIToken.TokenError.storageUnavailable }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(tokens)
         try OwnerOnlyFile.write(data, to: fileURL)
     }
 
+    // MARK: - 创建 / 撤销
+
+    /// 新建一个令牌，返回**只此一次**的完整令牌串。
     @discardableResult
     func create(
         label: String,
         scopes: [APIToken.Scope],
         expiresAt: Date? = nil
     ) throws -> (token: APIToken, secret: String) {
+        guard loadError == nil else { throw APIToken.TokenError.storageUnavailable }
         let secret = Self.generateSecret()
         guard let digest = Self.hash(secret) else {
             throw APIToken.TokenError.hashFailed
         }
+        var id: String
+        repeat { id = "t_" + UUID().uuidString.prefix(8).lowercased() }
+        while tokens.contains(where: { $0.id == id })
         let token = APIToken(
-            id: "t_" + UUID().uuidString.prefix(8).lowercased(),
+            id: id,
             label: label.trimmingCharacters(in: .whitespacesAndNewlines),
             tokenHash: digest,
             scopes: scopes,
@@ -136,13 +175,22 @@ final class APITokenStore {
             lastUsedAt: nil,
             callCount: 0
         )
+        let snapshot = tokens
         tokens.append(token)
-        try save()
+        do { try save() }
+        catch {
+            tokens = snapshot
+            throw error
+        }
         return (token, secret)
     }
 
+    /// 撤销一个令牌。**持久化失败会回滚内存并返回 false**——P2 修复
+    /// （2026-10-03）：旧实现 `try? save()`，磁盘满/权限问题时内存里已删、
+    /// 文件还是旧的，重启后"已撤销"的令牌会复活。
     @discardableResult
     func revoke(id: String) -> Bool {
+        guard loadError == nil else { return false }
         let snapshot = tokens
         tokens.removeAll { $0.id == id }
         do {
@@ -159,6 +207,7 @@ final class APITokenStore {
 
     @discardableResult
     func revokeAll() -> Bool {
+        guard loadError == nil else { return false }
         let snapshot = tokens
         tokens = []
         do {
@@ -173,11 +222,14 @@ final class APITokenStore {
         }
     }
 
+    // MARK: - 校验
+
+    /// 校验一个令牌串。返回命中的令牌（含作用域）。
     func verify(secret: String) -> APIToken? {
         guard !secret.isEmpty else { return nil }
-
+        // 哈希失败时宁可"谁都进不来"，也不要出现"空哈希相互匹配"这种放行。
         guard let digest = Self.hash(secret), !digest.isEmpty else { return nil }
-
+        // 常量时间比较：本机 socket 上做时序攻击不现实，但比较一个秘密时按行规来。
         for token in tokens where token.tokenHash.count == digest.count {
             if Self.constantTimeEquals(token.tokenHash, digest),
                !token.isExpired {
@@ -187,6 +239,11 @@ final class APITokenStore {
         return nil
     }
 
+    /// 记录一次使用。落盘**节流**（P2/P3 修复 2026-10-03）：lastUsedAt/callCount
+    /// 只是使用统计，不值得每个请求都整文件重写（临时文件 + rename，且在主
+    /// actor 上同步 IO）——最多每 30 秒落一次盘；退出时未落盘的变更由
+    /// `flushPendingUse` 补写。写失败只记日志：统计丢失不影响安全，但不能
+    /// 静默到排查时看不见。
     func recordUse(id: String) {
         guard let index = tokens.firstIndex(where: { $0.id == id }) else {
             return
@@ -211,6 +268,7 @@ final class APITokenStore {
         }
     }
 
+    /// 把未落盘的使用统计强制写一次（应用退出时调用）。
     func flushPendingUse() {
         guard pendingUsePersist else { return }
         pendingUsePersist = false
@@ -223,6 +281,8 @@ final class APITokenStore {
             )
         }
     }
+
+    // MARK: - 小工具
 
     static func generateSecret() -> String {
         var bytes = [UInt8](repeating: 0, count: 32)
@@ -237,7 +297,8 @@ final class APITokenStore {
     }
 
     static func hash(_ secret: String) -> String? {
-
+        // 复用仓库里已有的哈希（SHA-256 十六进制），不引第二个实现。
+        // 它可能失败（返回 nil）——那种情况下**绝不能**退化成"随便一个令牌都放行"。
         ContentHasher.hash(text: secret)
     }
 

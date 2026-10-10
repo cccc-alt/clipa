@@ -1,5 +1,12 @@
 import Foundation
 
+/// The wording used when a manually ignored app is taken off the list.
+///
+/// It used to live in the settings window. The status bar menu removes entries
+/// now, and the subtlety it encodes still matters: an app can be listed both by
+/// hand and by the password-manager rule, and dropping the manual entry does not
+/// stop it being ignored. Claiming "已移除" in that case is a lie the user only
+/// discovers the next time a password fails to appear in the history.
 enum IgnoreListNotice {
     struct Notice: Equatable {
         var text: String

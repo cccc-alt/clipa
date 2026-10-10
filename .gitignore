@@ -10,5 +10,16 @@ xcuserdata/
 .build/
 dist/
 
+# Local credentials and clipboard data
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.keychain-db
+*.p12
+*.p8
+
 # OS
 .DS_Store

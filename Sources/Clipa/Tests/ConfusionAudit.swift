@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 
+/// Readable audit corpus for the most confusion-prone content categories.
+/// Each category has 15 representative samples; expected values encode the
+/// product intent described in the user manual, not today's implementation.
 struct ConfusionAuditCase {
     let category: String
     let id: String
@@ -27,7 +30,7 @@ enum ConfusionAudit {
     }
 
     static let textCases: [ConfusionAuditCase] = [
-
+        // JSON
         c("json", "J-01", #"{"name":"tom","age":18}"#, expected: .json, kind: .text),
         c("json", "J-02", #"["nginx","redis"]"#, expected: .json, kind: .text),
         c("json", "J-03", #"{"server":{"host":"127.0.0.1","port":8080}}"#, expected: .json, kind: .text),
@@ -44,6 +47,7 @@ enum ConfusionAudit {
         c("json", "J-14", #"请把 {"a":1} 放到配置里"#, expected: nil),
         c("json", "J-15", #"{'a':1}"#, expected: nil),
 
+        // YAML
         c("yaml", "Y-01", "name: nginx\nimage: nginx:latest\nreplicas: 3", expected: .yaml, kind: .text),
         c("yaml", "Y-02", "servers:\n  - web01\n  - web02", expected: .yaml, kind: .text),
         c("yaml", "Y-03", "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: nginx", expected: .yaml, kind: .text),
@@ -60,6 +64,7 @@ enum ConfusionAudit {
         c("yaml", "Y-14", "- first\n- second\n- third", expected: .markdown),
         c("yaml", "Y-15", "server:host: 8080", expected: nil),
 
+        // Markdown
         c("markdown", "M-01", "# 网络配置\n\n下面列出常用命令：\n\n- docker network ls\n- docker network inspect", expected: .markdown),
         c("markdown", "M-02", "## 说明\n\n```bash\necho hi\n```", expected: .markdown),
         c("markdown", "M-03", "| Name | Value |\n| --- | --- |\n| a | 1 |", expected: .markdown),
@@ -76,6 +81,7 @@ enum ConfusionAudit {
         c("markdown", "M-14", "Plain text with a [square bracket]", expected: nil),
         c("markdown", "M-15", "```\nfunc f() {}\n```", expected: .markdown),
 
+        // Log
         c("log", "L-01", "2026-09-09 10:00:01 INFO server started\n2026-09-09 10:00:02 INFO ready", expected: nil),
         c("log", "L-02", "2026-09-09 10:01:23 ERROR connection refused", expected: nil),
         c("log", "L-03", "[INFO] server started\n[ERROR] db failed", expected: nil),
@@ -92,6 +98,7 @@ enum ConfusionAudit {
         c("log", "L-14", "level: ERROR\nmessage: connection failed", expected: .yaml, kind: .text),
         c("log", "L-15", "10:00:01.123 123 456 I Tag: hello", expected: nil),
 
+        // URL/link
         c("url", "U-01", "https://example.com/a?b=1", expected: nil),
         c("url", "U-02", "example.com/path", expected: nil),
         c("url", "U-03", "www.apple.com", expected: nil),
@@ -108,6 +115,7 @@ enum ConfusionAudit {
         c("url", "U-14", "2026-09-09 10:00:01 INFO GET https://example.com/api", expected: nil),
         c("url", "U-15", "192.168.1.1", expected: nil),
 
+        // Email
         c("email", "E-01", "admin@example.com", expected: nil),
         c("email", "E-02", "user+test@example.com", expected: nil),
         c("email", "E-03", "dev.ops@mail.example.co.jp", expected: nil),
@@ -124,6 +132,7 @@ enum ConfusionAudit {
         c("email", "E-14", "@user 不是邮箱", expected: nil),
         c("email", "E-15", "admin@example.com support@example.com", expected: nil),
 
+        // Command
         c("command", "C-01", "git status", expected: nil, kind: .text),
         c("command", "C-02", "docker compose up -d", expected: nil, kind: .text),
         c("command", "C-03", "python3 -m http.server 8000", expected: nil, kind: .text),
@@ -140,6 +149,7 @@ enum ConfusionAudit {
         c("command", "C-14", "please run the deploy script.", expected: nil),
         c("command", "C-15", "FOO=bar node app.js && echo done", expected: nil, kind: .text),
 
+        // Text
         c("text", "T-01", "这是一段普通的中文文本。", expected: nil),
         c("text", "T-02", "This is a normal English sentence.", expected: nil),
         c("text", "T-03", "时间: 下午三点", expected: nil),
@@ -211,6 +221,8 @@ enum ConfusionAudit {
             ? String(collapsed.prefix(60)) + "…"
             : collapsed
     }
+
+    // MARK: - Image / file media audit
 
     private static func runMediaAudit() -> Int {
         let png = Data(
@@ -307,6 +319,9 @@ enum ConfusionAudit {
         }
         fileChecks += fileExtensions.count
 
+        // Clipa stores image bytes as-is, so a file with an image extension
+        // stays an image clip even when its bytes are not a real image; the
+        // preview shows a placeholder instead of the capture being lost.
         auditFile(
             "broken.png",
             data: Data("not-an-image".utf8),
@@ -315,6 +330,7 @@ enum ConfusionAudit {
         )
         imageChecks += 1
 
+        // Multiple file URLs are one file clip, never one image clip.
         do {
             let first = root.appendingPathComponent("multi-a.png")
             let second = root.appendingPathComponent("multi-b.png")
@@ -338,7 +354,7 @@ enum ConfusionAudit {
                 policy: CapturePolicySnapshot(settings: settings),
             )
         if case .captured(let draft) = decision, draft.kind == .file {
-
+                // pass
             } else {
                 failed += 1
                 fileFailed += 1
@@ -407,6 +423,7 @@ enum ConfusionAudit {
             print("[CONFUSION-FAIL] media-IMG-12 tiff unavailable")
         }
 
+        // A text snippet whose filename looks like an image is text.
         do {
             imageChecks += 1
             let pb = NSPasteboard(
@@ -427,7 +444,7 @@ enum ConfusionAudit {
                 policy: CapturePolicySnapshot(settings: settings),
             )
             if case .captured(let draft) = decision, draft.kind == .text {
-
+                // pass
             } else {
                 failed += 1
                 imageFailed += 1
@@ -438,6 +455,7 @@ enum ConfusionAudit {
             }
         }
 
+        // A directory is a file clip even when it could be confused with media.
         do {
             imageChecks += 1
             fileChecks += 1
@@ -467,7 +485,7 @@ enum ConfusionAudit {
                 policy: CapturePolicySnapshot(settings: settings),
             )
             if case .captured(let draft) = decision, draft.kind == .file {
-
+                // pass
             } else {
                 failed += 1
                 fileFailed += 1

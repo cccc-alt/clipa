@@ -4,6 +4,10 @@ import Foundation
 import ImageIO
 import SwiftUI
 
+/// One row of the flattened history list: a section title or a clip.
+///
+/// Identities are global (`clip-<uuid>` / `header-<section>`), which is what
+/// lets a row keep its identity while the list around it changes.
 enum HistoryListEntry: Identifiable {
     case header(ClipSectionModel)
     case clip(UUID)
@@ -18,28 +22,42 @@ enum HistoryListEntry: Identifiable {
     }
 }
 
+/// Clipa's search box is a single local-search flow: everything the user types
+/// is a literal keyword, resolved by the local engine with no network involved.
 enum SearchState: Equatable {
     case idle
     case searching
     case showingResults
 }
 
+/// Thin UI-state coordinator. Search parsing/validation/ranking/FTS live in
+/// SearchEngine; SQL lives in DatabaseManager.
 @MainActor
-/// Panel state and actions: search, selection, notes, privacy.
 final class PanelViewModel: ObservableObject {
-
+    /// Rebound in place when the active workspace changes. The panel, its
+    /// window and its SwiftUI hosting view outlive a workspace switch — SwiftUI
+    /// keeps the hosting view (and therefore this view model) alive even after
+    /// the window drops its content view — so building a second view model
+    /// would leave the previous workspace's whole history resident.
     private(set) var store: ClipStore
     let settings: SettingsStore
 
     private var searchPipeline: DefaultSearchPipeline
     private var cancellables = Set<AnyCancellable>()
-
+    /// Settings live outside the workspace cycle, so this one subscription is
+    /// kept apart from `cancellables` and survives a store rebind.
     private var settingsCancellable: AnyCancellable?
-
+    /// Follows `ClipStore.shared` across a workspace switch. Kept out of
+    /// `cancellables` for the same reason as `settingsCancellable`: it has to
+    /// survive the very rebind it triggers.
     private var sharedStoreCancellable: AnyCancellable?
 
+    // Search state
     @Published var query = ""
-
+    /// 搜索结果的排序（2026-10-02）：`.relevance` 是默认（打分 + 新近加成，
+    /// 顺序会随输入变化）；`.newest` 是"位置稳定"的时间序 —— 按 `lastCopiedAt`
+    /// 排（最近一次复制时间），与不搜索时的列表顺序同源，所以切换前后
+    /// "同一内容在不搜索时排第几"的直觉保持一致。切换即重跑当前查询。
     @Published var searchSort: SearchSort = .relevance {
         didSet {
             guard oldValue != searchSort else { return }
@@ -50,10 +68,18 @@ final class PanelViewModel: ObservableObject {
     @Published private(set) var results: [ClipSectionModel] = []
     @Published private(set) var searchState: SearchState = .idle
 
+    // UI state
     @Published var kindFilter: ClipKind?
     @Published var smartTagFilter: SmartTag?
     @Published var isSearchFieldFocused = false
-
+    /// Which surface currently owns the keyboard.
+    ///
+    /// The main panel and the bottom strip share this one view model, and both
+    /// of them focus their own search field when the shared `openTick` (or a
+    /// finished search) changes. Without a single owner the two views fought:
+    /// opening the strip immediately handed focus to the hidden main panel, and
+    /// every keystroke's result update took the caret away again — the box
+    /// accepted one character and then went dead.
     enum Surface {
         case main
         case quickStrip
@@ -62,41 +88,88 @@ final class PanelViewModel: ObservableObject {
     @Published var selectedID: UUID?
     @Published var openTick = 0
     @Published var toast: String?
-
+    /// True while the card row should scroll to follow the selection.
+    ///
+    /// The reader moving the selection (arrows, click, favouriting a card) asks
+    /// the row to follow; the list changing *under* them — a delete, a capture
+    /// landing — must not, or deleting a card would also throw away the place
+    /// they were reading from.
     @Published private(set) var revealSelection = true
-
+    /// Bumped on every *deliberate* selection. A counter rather than the
+    /// selection id, because re-selecting the card that is already selected
+    /// still has to scroll it into view — and a flag alone cannot tell that
+    /// apart from "nothing happened".
     @Published private(set) var revealRequestTick = 0
     @Published var noteDraft = ""
     @Published var showNoteEditor = false
+    @Published private(set) var noteEditingID: UUID?
+    @Published private(set) var noteIsSaving = false
+    @Published var noteError: String?
+    @Published var noteDiscardConfirmation = false
+    @Published var previewID: UUID?
+    @Published private(set) var copyingID: UUID?
+    private var noteOperation: UUID?
+    private struct DraftKey: Hashable { let directory: String; let id: UUID }
+    @Published private var noteDrafts: [DraftKey: String] = [:]
+    var hasAnyNoteDrafts: Bool { !noteDrafts.isEmpty || (showNoteEditor && hasUnsavedNote) }
+    func discardAllNoteDrafts() {
+        noteDrafts.removeAll()
+        discardNoteChanges()
+    }
+    var noteEditingItem: Clip? { (noteEditingID ?? selectedID).flatMap { store.clip(id: $0) } }
+    var previewItem: Clip? { previewID.flatMap { store.clip(id: $0) } }
+    var hasUnsavedNote: Bool { noteEditingItem.map { noteDraft != $0.note } ?? !noteDraft.isEmpty }
+    var pendingNoteCount: Int {
+        noteDrafts.keys.filter { $0.directory == store.dataDirectory.path && store.clip(id: $0.id)?.isPrivate == false }.count
+    }
     @Published private var privateUnlockedIDs: Set<UUID> = []
 
-    var onPark: (() -> Void)?
 
+    /// Called when the user clicks an empty/background area of the panel,
+    /// which is treated as an outside click: the panel parks below the app
+    /// instead of swallowing the click.
+    var onPark: (() -> Void)?
+    /// Called when a system authentication prompt starts / finishes. The panel
+    /// controller keeps the clipboard overlay floating while the prompt is up
+    /// and brings it back to the front after the user accepts or cancels it.
     var onPrivateAuthenticationStateChanged: ((Bool) -> Void)?
 
     private var toastWork: DispatchWorkItem?
     private var privateUnlockTimers: [UUID: DispatchWorkItem] = [:]
-    private var privateUnlockInFlight = false
-
+    @Published private(set) var privateUnlockInFlight = false
+    /// Guards rapid duplicate clicks while a DB-backed UI mutation is in
+    /// flight; without it a second click can act on stale pre-await state.
     private var pendingMutatingIDs: Set<UUID> = []
 
     private var searchTask: Task<Void, Never>?
     private var searchGeneration = 0
-
+    /// Who should take the selection when the card it is on disappears: the
+    /// visible card that follows it (or the one before it, when the deleted card
+    /// was last). Set by the delete, consumed by `reconcileSelection`.
     private var selectionSuccessor: UUID?
-
+    /// Flat row order used by arrow navigation, kept separate from the
+    /// sectioned UI so repeated key presses do not re-flatten all results.
     @Published private(set) var navigationOrder: [UUID] = []
-
+    /// Section titles and rows flattened once per result set. The view used to
+    /// rebuild this on every body evaluation, which is an O(rows) allocation
+    /// per redraw — 100k entries on the library that froze the panel.
     @Published private(set) var listEntries: [HistoryListEntry] = []
-
+    /// The slice of `listEntries` the view is allowed to build. SwiftUI builds
+    /// a row value for *every* entry it is handed, not just the visible ones,
+    /// so the window is what keeps a 100k-result search from freezing.
     @Published private(set) var renderedRange: Range<Int> = 0..<0
-
+    /// Section title for the section the window currently starts inside, so a
+    /// window that begins mid-section still renders its heading.
     private var renderedContextHeader: HistoryListEntry?
-
+    /// Entry index (inside `listEntries`) for each position in
+    /// `navigationOrder`, so keyboard navigation can put the selected row
+    /// inside the window before the view tries to scroll to it.
     private var entryIndexByNavigationIndex: [Int] = []
     private var lastNavigationSelectedID: UUID?
     private var lastNavigationIndex = 0
 
+    /// Rows added each time the window is extended. Big enough that ordinary
+    /// scrolling rarely waits, small enough that a redraw stays cheap.
     static let listWindowPageSize = 300
 
     init(
@@ -113,11 +186,18 @@ final class PanelViewModel: ObservableObject {
             )
         )
         subscribeToStores()
-
+        // Settings are shared by every workspace, so this subscription is not
+        // store-bound and is set up exactly once.
         settingsCancellable = settings.$pauseRecording
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.objectWillChange.send() }
 
+        // The panel captured one store at init, and the window plus its SwiftUI
+        // hosting view outlive a workspace switch, so nothing rebuilds it. Wiring
+        // the follow-up here instead of in the switcher means no caller can
+        // forget it — which is exactly what happened: `rebind` existed, was
+        // tested, and was never called, so switching workspaces left the page on
+        // the old history while the capture path had already moved.
         sharedStoreCancellable = NotificationCenter.default
             .publisher(for: ClipStore.sharedReplacedNotification)
             .receive(on: RunLoop.main)
@@ -125,20 +205,30 @@ final class PanelViewModel: ObservableObject {
                 self?.rebind(store: .shared)
             }
 
+        // First paint: run the search off the main actor like every other
+        // refresh. The synchronous variant below stays for tests and for
+        // callers that must have a result in hand before returning.
         refreshWithoutBlockingMainThread()
     }
 
+    /// Wires up everything that follows the store, so a workspace switch can
+    /// re-do exactly this against the new store.
     private func subscribeToStores() {
         store.itemsPublisher
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.objectWillChange.send()
-
+                self.pruneDrafts()
+                // A capture / pin / delete reordered the rows; keep the
+                // reader's place instead of snapping the window.
                 self.refreshActiveQuery(preserveWindow: true)
                 if let selectedID = self.selectedID,
                    self.store.clip(id: selectedID) == nil {
-
+                    // P2 修复（2026-10-03）：不再留"无选中"窗口——旧写法把
+                    // 选中清空后要等 40ms debounce 的刷新回来才补，期间按
+                    // Return 会落到第一张卡。立即在当前导航序里把选中钉到
+                    // 被删条目的邻居，随后的 reconcile 再做权威修正。
                     self.selectedID = self.neighborOf(removing: selectedID)
                 }
             }
@@ -153,7 +243,21 @@ final class PanelViewModel: ObservableObject {
 
     }
 
+    /// Drops everything bound to the current store.
+    ///
+    /// Every one of these is a path back to the store: the Combine
+    /// subscriptions, the result arrays, the row/image caches and the tasks
+    /// that may still be reading it. A workspace switch has to clear all of
+    /// them, otherwise the previous workspace's history stays resident — which
+    /// is what made an empty workspace cost 530MB.
     private func releaseStoreBoundState() {
+        suspendNoteEditor()
+        previewID = nil
+        noteOperation = nil
+        noteIsSaving = false
+        noteEditingID = nil
+        noteDraft = ""
+        noteError = nil
         searchTask?.cancel()
         searchTask = nil
         toastWork?.cancel()
@@ -170,10 +274,14 @@ final class PanelViewModel: ObservableObject {
         renderedContextHeader = nil
         privateUnlockedIDs = []
         pendingMutatingIDs = []
-
+        // P2 修复（2026-10-03）：解锁计时也归零。旧实现只清了视图侧状态，
+        // PrivacyGate 的 unlockDeadlines 跨工作区继续计时——状态双源不一致。
         PrivacyGate.shared.markLocked()
     }
 
+    /// 被删条目的导航邻居（优先下一位，其次上一位）。给"items 已变更但
+    /// 刷新尚未返回"的窗口期用：此刻 navigationOrder 仍是旧序，但足以把
+    /// 选中钉在删除点附近，而不是任由 Return 落到第一张卡。
     private func neighborOf(removing id: UUID) -> UUID? {
         guard let index = navigationOrder.firstIndex(of: id) else {
             return navigationOrder.first
@@ -185,6 +293,8 @@ final class PanelViewModel: ObservableObject {
         return nil
     }
 
+    /// Points the panel at another workspace's store without rebuilding the
+    /// panel. See `store` for why the panel is reused instead of replaced.
     func rebind(store: ClipStore) {
         guard store !== self.store else { return }
         releaseStoreBoundState()
@@ -204,6 +314,12 @@ final class PanelViewModel: ObservableObject {
         refreshWithoutBlockingMainThread()
     }
 
+    /// Re-runs the current query away from the main actor, without the typing
+    /// debounce. Used by actions that change the result set (delete, store retry)
+    /// and by the first paint, which all used to run the whole search —
+    /// including the database round trip — synchronously on the main thread and
+    /// froze the panel for its duration (measured 118 ms for a broad keyword on
+    /// a 1050-clip library).
     private func refreshWithoutBlockingMainThread() {
         searchTask?.cancel()
         searchGeneration += 1
@@ -214,6 +330,8 @@ final class PanelViewModel: ObservableObject {
         )
     }
 
+    // MARK: - Search
+
     private var currentFilter: SearchFilter {
         SearchFilter(
             kinds: kindFilter.map { [$0] } ?? [],
@@ -221,12 +339,19 @@ final class PanelViewModel: ObservableObject {
         )
     }
 
+    /// Kept for the filter row that was removed from the panel. Both setters
+    /// used to change state without asking for a re-query, so re-wiring them
+    /// would have produced "switching the filter does nothing".
     func selectKindFilter(_ kind: ClipKind?) {
         smartTagFilter = nil
         kindFilter = kind
         filtersDidChange()
     }
 
+    // MARK: - Store recovery
+
+    /// Retries the database open and reports the outcome without ever hiding
+    /// the failure state behind a normal-looking empty history.
     func retryStoreConnection() {
         if store.retryDatabaseOpen() {
             showToast(StoreUnavailableCopy.retrySucceeded)
@@ -235,6 +360,7 @@ final class PanelViewModel: ObservableObject {
         }
     }
 
+    /// Opens the folder holding clips.sqlite and images/.
     func revealDataDirectory() {
         NSWorkspace.shared.activateFileViewerSelecting([store.dataDirectory])
     }
@@ -255,17 +381,28 @@ final class PanelViewModel: ObservableObject {
         kindFilter != nil || smartTagFilter != nil
     }
 
+    /// True when the list is showing a subset of the stored history: search
+    /// text or a type filter.
     var hasActiveFilter: Bool {
         isFiltering
             || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Count line under the list.
+    ///
+    /// While a filter is active it reports the rows actually on screen next to
+    /// the stored total, so the number can never contradict what the list is
+    /// showing. Without a filter the two are the same, and the plain total
+    /// stays the more natural reading.
     var historyCountText: String {
         let total = store.items.count
         guard hasActiveFilter else { return "共 \(total) 条" }
         return "结果 \(navigationOrder.count) 条 · 共 \(total) 条"
     }
 
+    /// Filter-menu label. Row labels keep `SmartTag.displayName` (e.g. “文本”,
+    /// “链接”), while the menu uses a distinct wording so coarse-kind and
+    /// smart-tag entries never look duplicated.
     func filterTitle(for tag: SmartTag) -> String {
         switch tag {
         case .text: return "文本"
@@ -293,6 +430,15 @@ final class PanelViewModel: ObservableObject {
         reconcileSelection(with: navigationOrder)
     }
 
+    // MARK: - Rendered list window
+
+    /// Flattens the sections once per result set and starts the window at the
+    /// top. Also records where each navigable clip sits inside the flattened
+    /// list, so navigation can keep its target inside the window.
+    ///
+    /// `preserveWindow` keeps the reader where they were: a pin, delete or
+    /// capture reorders the rows underneath them, and snapping back to the top
+    /// (or recentring on the moved row) would throw away their place.
     private func rebuildListEntries(preserveWindow: Bool = false) {
         var entries: [HistoryListEntry] = []
         entries.reserveCapacity(navigationOrder.count + results.count)
@@ -321,6 +467,8 @@ final class PanelViewModel: ObservableObject {
         }
     }
 
+    /// What the view should build: the window, preceded by the current
+    /// section's title when the window starts in the middle of a section.
     var renderedEntries: [HistoryListEntry] {
         guard !renderedRange.isEmpty,
               renderedRange.upperBound <= listEntries.count else {
@@ -337,6 +485,11 @@ final class PanelViewModel: ObservableObject {
         renderedRange.upperBound < listEntries.count
     }
 
+    /// The clips the card row is allowed to build, in navigation order.
+    ///
+    /// Section headers are dropped — the strip is one flat row — but the window
+    /// is what keeps a 100k-row library cheap: the view builds this slice and
+    /// asks for the next page when the reader reaches its end.
     var renderedClips: [Clip] {
         renderedEntries.compactMap { entry in
             guard case .clip(let clipID) = entry else { return nil }
@@ -344,6 +497,8 @@ final class PanelViewModel: ObservableObject {
         }
     }
 
+    /// True while the row is showing only part of the results, i.e. while
+    /// scrolling further right still has something to reveal.
     var canLoadMoreCards: Bool {
         canExtendRenderedWindow
     }
@@ -352,6 +507,8 @@ final class PanelViewModel: ObservableObject {
         renderedRange.lowerBound > 0
     }
 
+    /// Grows the window when the user scrolls toward its end. The window only
+    /// ever grows downwards here, so the section heading above it stays valid.
     func extendRenderedWindow() {
         guard canExtendRenderedWindow else { return }
         let upper = min(
@@ -361,6 +518,11 @@ final class PanelViewModel: ObservableObject {
         renderedRange = renderedRange.lowerBound..<upper
     }
 
+    /// Grows the window upwards when the user scrolls back to its top.
+    ///
+    /// Without this the window is a one-way door: a window that was recentred
+    /// (keyboard navigation, or the selection moving after a pin/delete) has
+    /// no rows above it, so the list can never be scrolled back up.
     func extendRenderedWindowUpward() {
         guard canExtendRenderedWindowUpward else { return }
         let lower = max(
@@ -371,6 +533,9 @@ final class PanelViewModel: ObservableObject {
         renderedContextHeader = contextHeader(before: lower)
     }
 
+    /// Makes sure the row for `clipID` is inside the window before the view
+    /// scrolls to it. A far jump recentres the window instead of building
+    /// everything between here and there.
     func ensureEntryVisible(clipID: UUID) {
         guard let navigationIndex = navigationOrder.firstIndex(of: clipID),
               entryIndexByNavigationIndex.indices.contains(navigationIndex)
@@ -386,11 +551,13 @@ final class PanelViewModel: ObservableObject {
         let page = Self.listWindowPageSize
         if entryIndex >= renderedRange.upperBound,
            entryIndex - renderedRange.upperBound < page {
-
+            // Just past the end: grow the window, which keeps the current
+            // section heading correct.
             extendRenderedWindow()
             if renderedRange.contains(entryIndex) { return }
         }
-
+        // A far jump (keyboard navigation wraps from the first row to the
+        // last): recentre so the window stays bounded.
         let start = max(
             0,
             min(entryIndex - page / 2, max(0, listEntries.count - page))
@@ -400,6 +567,8 @@ final class PanelViewModel: ObservableObject {
         renderedContextHeader = contextHeader(before: start)
     }
 
+    /// The section title that governs `index`, when the window starts inside a
+    /// section rather than on its heading.
     private func contextHeader(before index: Int) -> HistoryListEntry? {
         var cursor = min(index, listEntries.count - 1)
         while cursor >= 0 {
@@ -411,12 +580,23 @@ final class PanelViewModel: ObservableObject {
         return nil
     }
 
+    /// Keeps the highlighted row/detail pane inside the currently visible
+    /// result set after pin/private/delete/filter operations reorder rows.
     private func reconcileSelection(with visibleIDs: [UUID]) {
-
+        // Where the selection should land if the card it was on has gone:
+        // `selectionSuccessor`, recorded by the delete itself. Falling back to
+        // the first row is only right when there is no such card (an empty
+        // selection at first paint, a filter that removed everything else).
+        //
+        // Both branches below need this: the store subscription clears
+        // `selectedID` the moment the row disappears, so a delete arrives here
+        // as "nothing selected" rather than "the old id is gone".
         let successor = selectionSuccessor.flatMap { candidate in
             visibleIDs.contains(candidate) ? candidate : nil
         }
-
+        // No selection over a non-empty list is a dead end: the list shows
+        // rows, nothing looks selected, and Return has nothing to copy. Adopt
+        // the first row instead of leaving the panel in that state.
         if selectedID == nil, let nextID = successor ?? visibleIDs.first {
             selectionSuccessor = nil
             revealSelection = false
@@ -426,10 +606,15 @@ final class PanelViewModel: ObservableObject {
             return
         }
         if let selectedID, !visibleIDs.contains(selectedID) {
-
+            // The card the reader was on is gone. Land on the one that took its
+            // place — `selectionSuccessor`, recorded by the delete itself —
+            // and only fall back to the first row when there is no such card.
+            // Deleting a card should not also move the reader to the top.
             selectionSuccessor = nil
             revealSelection = false
-
+            // The editor went with the card it belonged to. Leaving it open
+            // re-targeted it at the neighbour, so "保存" wrote the deleted card's
+            // text onto a different row.
             if showNoteEditor {
                 showNoteEditor = false
                 noteDraft = ""
@@ -448,15 +633,23 @@ final class PanelViewModel: ObservableObject {
                 noteDraft = ""
             }
         }
-
+        // Deliberately no `ensureEntryVisible` here: reconciling after a pin /
+        // delete / capture is a background reorder, and recentring the window
+        // on the moved row made the list jump (and, before upward extension
+        // existed, left it unable to scroll back). The window stays where the
+        // reader left it; keyboard navigation is what asks to follow the
+        // selection, and it does so in `moveSelection`.
     }
 
     func refreshSearch() {
-
+        // A synchronous refresh always wins over anything still running in the
+        // background: bumping the generation here makes an in-flight search
+        // drop its (now older) result instead of overwriting this one.
         searchGeneration += 1
         let filter = currentFilter
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-
+        // Empty search is the default history view. Any non-empty ordinary
+        // local search treats the whole box content as one literal keyword.
         if trimmed.isEmpty {
             let result = searchPipeline.performLocalSearch(
                 query: "",
@@ -476,6 +669,19 @@ final class PanelViewModel: ObservableObject {
             .isEmpty ? .idle : .showingResults
     }
 
+    /// Re-runs the current query away from the main actor. Used whenever the
+    /// inputs changed but the query text did not: a capture landed, a row was
+    /// deleted, a filter chip was toggled. These all used to re-run the whole
+    /// search on the main actor — 31 ms for the plain history view and up to
+    /// 170 ms for a broad keyword.
+    ///
+    /// The 40 ms debounce matters as much as the thread hop: a burst of
+    /// captures publishes `items` once per row, and every search holds the
+    /// database actor for its whole duration, so coalescing is what keeps the
+    /// next capture from queueing behind three of them.
+    /// `preserveWindow` is for refreshes the reader did not ask for — a
+    /// capture landing, a row captured or deleted. The result set is rebuilt
+    /// underneath them, but the window they were reading stays put.
     private func refreshActiveQuery(preserveWindow: Bool = false) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask?.cancel()
@@ -507,7 +713,10 @@ final class PanelViewModel: ObservableObject {
         guard !trimmed.isEmpty else {
             searchGeneration += 1
             searchState = .idle
-
+            // Clearing the box is the other half of the typing path: the full
+            // history view costs ~31 ms on the main actor (1012 rows), so it
+            // goes off-main as well — `refreshActiveQuery` covers the empty
+            // query too.
             refreshActiveQuery()
             return
         }
@@ -517,6 +726,7 @@ final class PanelViewModel: ObservableObject {
         let filter = currentFilter
         searchState = .searching
 
+        // 40ms local debounce: FTS is not fired once per keystroke.
         searchTask = Task { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: 40_000_000)
@@ -533,6 +743,17 @@ final class PanelViewModel: ObservableObject {
         }
     }
 
+    /// Runs the local search for `query` off the main actor and applies the
+    /// result back on it.
+    ///
+    /// The panel used to call `performLocalSearch` inside `MainActor.run`,
+    /// so every keystroke froze the UI for the whole query — measured
+    /// 31–193 ms on a production-sized library (FTS + validation + ranking).
+    /// The search now reads an O(1) copy-on-write `SearchSnapshot` taken here
+    /// on the main actor, and the expensive part runs on a background task.
+    /// Results are identical because the snapshot is the same state the
+    /// main-thread run read, and `generation` still decides what may be
+    /// applied, so an out-of-order finish can never win.
     private func runLocalSearch(
         query: String,
         filter: SearchFilter,
@@ -543,17 +764,26 @@ final class PanelViewModel: ObservableObject {
         let pipeline = searchPipeline
         let sort = searchSort
         searchTask = Task { [weak self] in
-
+            // A newer keystroke / capture may already have superseded this
+            // work while it sat in the queue. Bail before touching SQLite:
+            // every FTS hit holds the database actor, and a stale search that
+            // still runs makes the *next* capture wait behind it.
             guard !Task.isCancelled else { return }
-
-            let result = await Task.detached(priority: .userInitiated) {
+            // `performLocalSearchAsync` awaits the database actor instead of
+            // blocking the cooperative thread that runs this detached task.
+            let worker = Task.detached(priority: .userInitiated) {
                 await pipeline.performLocalSearchAsync(
                     query: query,
                     uiFilter: filter,
                     dataSource: snapshot,
                     sort: sort
                 )
-            }.value
+            }
+            let result = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
             guard let owner = self, !Task.isCancelled else { return }
             guard generation == owner.searchGeneration else { return }
             owner.applySearchPipelineResult(
@@ -567,6 +797,8 @@ final class PanelViewModel: ObservableObject {
         }
     }
 
+    /// Programmatic search entry used by the UI/state layer. Debounce and
+    /// result invalidation live in `queryDidChange`.
     func search() {
         queryDidChange()
     }
@@ -580,9 +812,15 @@ final class PanelViewModel: ObservableObject {
         queryDidChange()
     }
 
+    // MARK: - Search box scope
+
+    /// The single text field stays canonical; everything downstream derives
+    /// from this split.
     var searchBoxSplit: SearchBoxSplit {
         SearchBoxSplitter.split(query)
     }
+
+    // MARK: - Derived UI state
 
     var filteredItems: [Clip] {
         results.flatMap(\.clips)
@@ -606,6 +844,7 @@ final class PanelViewModel: ObservableObject {
         return store.clip(id: selectedID)
     }
 
+    /// Arrow-key navigation follows the exact order rows are displayed.
     func moveSelection(by delta: Int) {
         guard !navigationOrder.isEmpty else { return }
         let count = navigationOrder.count
@@ -625,11 +864,16 @@ final class PanelViewModel: ObservableObject {
         guard let item = store.clip(id: nextID) else { return }
         lastNavigationSelectedID = nextID
         lastNavigationIndex = next
-
+        // Keep the row inside the rendered window before the view scrolls to
+        // it; navigation wraps, so the target can be at the far end.
         ensureEntryVisible(clipID: nextID)
         selectGated(item)
     }
 
+    // MARK: - Convenience
+
+    /// Rows read the precomputed marker persisted with the clip; no per-row
+    /// regex scan happens during rendering.
     func isSensitive(_ item: Clip) -> Bool {
         item.containsSensitive
     }
@@ -639,7 +883,8 @@ final class PanelViewModel: ObservableObject {
         if seconds < 60 { return "刚刚" }
         if seconds < 3600 { return "\(Int(seconds / 60)) 分钟前" }
         if seconds < 86400 { return "\(Int(seconds / 3600)) 小时前" }
-
+        // P3 优化（2026-10-03）：DateFormatter 的创建很贵（ICU 解析格式），
+        // 一页 300 张卡 × 每键击重绘就是 300+ 次分配——静态缓存一份。
         return Self.relativeDateFormatter.string(from: date)
     }
 
@@ -649,51 +894,92 @@ final class PanelViewModel: ObservableObject {
         return formatter
     }()
 
-    func select(_ item: Clip) {
+    // MARK: - Item actions
 
+    func select(_ item: Clip) {
+        guard copyingID == nil, !noteIsSaving else { return }
+        if showNoteEditor, noteEditingID == item.id { return }
+        suspendNoteEditor()
         revealSelection = true
         revealRequestTick &+= 1
         selectionSuccessor = nil
+        if selectedID != item.id { selectedID = item.id }
+        noteDraft = item.isPrivate && !isPrivateUnlocked(item) ? "" : item.note
+    }
 
-        commitPendingNoteDraftIfNeeded()
-        if selectedID != item.id {
-            selectedID = item.id
-        }
-        if item.isPrivate, !isPrivateUnlocked(item) {
-            noteDraft = ""
-        } else if noteDraft != item.note {
-            noteDraft = item.note
-        }
-        if showNoteEditor {
-            showNoteEditor = false
+    private func draftKey(_ id: UUID) -> DraftKey { DraftKey(directory: store.dataDirectory.path, id: id) }
+
+    private func pruneDrafts() {
+        for key in noteDrafts.keys where key.directory == store.dataDirectory.path {
+            if store.clip(id: key.id)?.isPrivate != false { noteDrafts[key] = nil }
         }
     }
 
-    private func commitPendingNoteDraftIfNeeded() {
-        guard showNoteEditor, let editing = selectedItem else { return }
-        let draft = noteDraft
-        guard draft != editing.note else { return }
-        Task { [weak self] in
-            guard let self else { return }
-            let saved = await self.store.setNoteAsync(
-                draft.isEmpty ? nil : draft,
-                for: editing
-            )
-            if !saved {
-                self.showToast("备注保存失败，请重试")
-            }
+    /// Ordinary drafts remain in memory for this session, scoped by workspace.
+    /// Private drafts are never retained after the editor leaves the screen.
+    func suspendNoteEditor() {
+        guard showNoteEditor, !noteIsSaving else { return }
+        if let item = noteEditingItem {
+            let key = draftKey(item.id)
+            if !item.isPrivate, noteDraft != item.note { noteDrafts[key] = noteDraft }
+            else { noteDrafts[key] = nil }
         }
+        showNoteEditor = false
+        noteEditingID = nil
+        noteDiscardConfirmation = false
+        noteError = nil
+        noteDraft = ""
+    }
+
+    func requestCloseNoteEditor() {
+        guard !noteIsSaving else { return }
+        if noteDiscardConfirmation { noteDiscardConfirmation = false; return }
+        if hasUnsavedNote { noteDiscardConfirmation = true }
+        else { discardNoteChanges() }
+    }
+
+    func discardNoteChanges() {
+        guard !noteIsSaving else { return }
+        if let id = noteEditingID { noteDrafts[draftKey(id)] = nil }
+        showNoteEditor = false
+        noteEditingID = nil
+        noteDraft = ""
+        noteError = nil
+        noteDiscardConfirmation = false
+    }
+
+    func resumeNoteDraft() {
+        pruneDrafts()
+        guard let key = noteDrafts.keys.first(where: { $0.directory == store.dataDirectory.path }),
+              let item = store.clip(id: key.id) else { return }
+        openNoteEditor(item)
+    }
+
+    func openPreview(_ item: Clip? = nil) {
+        guard !noteIsSaving, let item = item ?? selectedItem ?? firstResultItem else { return }
+        select(item)
+        previewID = item.id
     }
 
     func selectGated(_ item: Clip) {
         select(item)
     }
 
+    /// Called by the view once it has scrolled the selection into view.
+    ///
+    /// The request is deliberately one-shot. While it stays set, *every* growth
+    /// of the rendered window re-centres the row on the selection — including
+    /// the growth the reader's own drag triggers when the next page is pulled
+    /// in, which snapped the card strip back to the selected card each time and
+    /// made "keep scrolling right" impossible. Nothing but a keyboard/deliberate
+    /// selection asks for a scroll, so the request is spent the moment it is
+    /// honoured.
     func consumeRevealRequest() {
         guard revealSelection else { return }
         revealSelection = false
     }
 
+    /// A private item is unlocked individually.
     func isPrivateUnlocked(_ item: Clip) -> Bool {
         privateUnlockedIDs.contains(item.id)
     }
@@ -707,7 +993,8 @@ final class PanelViewModel: ObservableObject {
             return
         }
         guard !privateUnlockInFlight else {
-
+            // P2 修复（2026-10-03）：说清是"已有验证在进行"——completion(false)
+            // 会让调用方弹"需要系统验证"，用户误以为是没权限。
             showToast("已有验证正在进行，请稍候")
             completion(false)
             return
@@ -733,12 +1020,16 @@ final class PanelViewModel: ObservableObject {
         }
     }
 
+    /// Requests a fresh system prompt. Unlike `requestPrivateUnlock`, this does
+    /// not reuse an existing 60-second unlock and does not create unlock state,
+    /// because it guards permanent state changes such as “取消私密”.
     func requestFreshPrivateAuthentication(
         reason: String,
         completion: @escaping (Bool) -> Void
     ) {
         guard !privateUnlockInFlight else {
-
+            // P2 修复（2026-10-03）：说清是"已有验证在进行"——completion(false)
+            // 会让调用方弹"需要系统验证"，用户误以为是没权限。
             showToast("已有验证正在进行，请稍候")
             completion(false)
             return
@@ -765,7 +1056,8 @@ final class PanelViewModel: ObservableObject {
         privateUnlockedIDs.remove(id)
         privateUnlockTimers[id]?.cancel()
         privateUnlockTimers[id] = nil
-        if selectedID == id {
+        noteDrafts[draftKey(id)] = nil
+        if selectedID == id || noteEditingID == id {
             if showNoteEditor {
                 showNoteEditor = false
             }
@@ -774,11 +1066,13 @@ final class PanelViewModel: ObservableObject {
         PrivacyGate.shared.markLocked(id)
     }
 
+    /// “解锁查看”：先完成系统认证并建立 60 秒解锁状态，但不复制内容。
     func unlockForPreview(_ item: Clip) {
         requestPrivateUnlock(for: item) { [weak self] ok in
             guard let self else { return }
             guard ok else {
-
+                // "Unlock to view" that silently does nothing is
+                // indistinguishable from a broken button.
                 NSSound.beep()
                 self.showToast("未解锁：需要系统验证")
                 return
@@ -796,7 +1090,8 @@ final class PanelViewModel: ObservableObject {
             return
         }
         _ = store.togglePrivate(current)
-
+        // Re-setting the same item to private must start locked again, even if
+        // an earlier 60-second unlock for that UUID is still valid.
         clearPrivateUnlockState(for: current.id)
         let nowPrivate = store.clip(id: item.id)?.isPrivate ?? false
         showToast(
@@ -896,6 +1191,13 @@ final class PanelViewModel: ObservableObject {
         performDelete(current)
     }
 
+    /// Records which card takes the selection when `id` is deleted: the card
+    /// that follows it, or the one before it when the deleted card was last.
+    ///
+    /// Deleting keeps the reader's place, which means two things: the row must
+    /// not scroll (hence `revealSelection = false`), and the selection must land
+    /// on the neighbour — the reconciler's fallback is the *first* row, which
+    /// would silently move the reader to the top of the list.
     private func rememberNeighbour(of id: UUID) {
         revealSelection = false
         guard let index = navigationOrder.firstIndex(of: id) else {
@@ -919,7 +1221,9 @@ final class PanelViewModel: ObservableObject {
         case .deleted:
             showToast("条目不存在或已被删除")
         case .failed:
-
+            // The recorded neighbour belongs to a delete that did not happen:
+            // leaving it set meant the *next* unrelated reorder that dropped the
+            // selection moved it to a card the user never touched.
             selectionSuccessor = nil
             NSSound.beep()
             showToast("删除失败，请重试")
@@ -952,7 +1256,10 @@ final class PanelViewModel: ObservableObject {
 
     private func performDeleteMany(_ items: [Clip]) {
         let requested = items.count
-
+        // Same "keep the reader's place" contract as the single-card delete: if
+        // the highlighted card is among the ones going away, remember where the
+        // selection should land instead of letting the reconciler fall back to
+        // the top of the list.
         if let selectedID, items.contains(where: { $0.id == selectedID }) {
             rememberNeighbour(of: selectedID)
         }
@@ -979,17 +1286,35 @@ final class PanelViewModel: ObservableObject {
     }
 
     func saveNote() {
-        guard !rejectIfHistoryClearing() else { return }
-        guard let item = selectedItem else { return }
+        guard !noteIsSaving, let item = validatedNoteTarget() else { return }
+        let saved = store.setNote(noteDraft.isEmpty ? nil : noteDraft, for: item)
+        completeNoteSave(saved, item: item, savedDraft: noteDraft)
+    }
+
+    private func validatedNoteTarget() -> Clip? {
+        guard !store.isClearingHistory else { noteError = "历史正在清空，请稍候。"; return nil }
+        guard let item = noteEditingItem else { noteError = "原条目已不存在，草稿仍留在输入框中。"; return nil }
         guard !item.isPrivate || isPrivateUnlocked(item) else {
-            showNoteEditor = false
-            noteDraft = ""
-            showToast("私密内容已重新锁定，未保存备注")
-            return
+            discardNoteChanges()
+            showToast("私密内容已锁定，未保存的备注已清除")
+            return nil
         }
-        _ = store.setNote(noteDraft.isEmpty ? nil : noteDraft, for: item)
-        showToast(noteDraft.isEmpty ? "已清除备注" : "已保存备注")
+        guard noteDraft.prefix(20_001).count <= 20_000 else {
+            noteError = "备注最多 20,000 个字，请缩短后再保存。"
+            return nil
+        }
+        return item
+    }
+
+    private func completeNoteSave(_ saved: Bool, item: Clip, savedDraft: String) {
+        guard saved else { noteError = "保存失败。草稿已保留，请重试。"; return }
+        noteDrafts[draftKey(item.id)] = nil
         showNoteEditor = false
+        noteEditingID = nil
+        noteDraft = ""
+        noteError = nil
+        noteDiscardConfirmation = false
+        showToast(savedDraft.isEmpty ? "已清除备注" : "已保存备注")
     }
 
     func togglePrivateAsync(_ item: Clip) async {
@@ -1002,7 +1327,8 @@ final class PanelViewModel: ObservableObject {
         guard beginMutation(for: current.id) else { return }
         defer { endMutation(for: current.id) }
         let updated = await store.togglePrivateAsync(current)
-
+        // Re-setting the same item to private must start locked again, even if
+        // an earlier 60-second unlock for that UUID is still valid.
         clearPrivateUnlockState(for: current.id)
         let nowPrivate = store.clip(id: item.id)?.isPrivate ?? false
         showToast(
@@ -1094,7 +1420,9 @@ final class PanelViewModel: ObservableObject {
             }
         }
         let requested = existing.count
-
+        // Same "keep the reader's place" contract as the single-card delete: if
+        // the highlighted card is going away, remember where the selection
+        // should land instead of letting the reconciler jump to the top.
         if let selectedID, ids.contains(selectedID) {
             rememberNeighbour(of: selectedID)
         }
@@ -1114,29 +1442,30 @@ final class PanelViewModel: ObservableObject {
     }
 
     func saveNoteAsync() async {
-        guard !rejectIfHistoryClearing() else { return }
-        guard let item = selectedItem else { return }
-        guard !item.isPrivate || isPrivateUnlocked(item) else {
-            showNoteEditor = false
-            noteDraft = ""
-            showToast("私密内容已重新锁定，未保存备注")
-            return
+        guard !noteIsSaving, !noteDiscardConfirmation, let item = validatedNoteTarget() else { return }
+        let source = store
+        let draft = noteDraft
+        let operation = UUID()
+        noteOperation = operation
+        noteIsSaving = true
+        noteError = nil
+        defer {
+            if noteOperation == operation { noteOperation = nil; noteIsSaving = false }
         }
-        let note = noteDraft
-        let saved = await store.setNoteAsync(
-            note.isEmpty ? nil : note,
-            for: item
-        )
-        showToast(
-            saved
-                ? (note.isEmpty ? "已清除备注" : "已保存备注")
-                : "备注保存失败，请重试"
-        )
-        showNoteEditor = false
+        let saved = await source.setNoteAsync(draft.isEmpty ? nil : draft, for: item)
+        guard store === source, noteOperation == operation else { return }
+        if item.isPrivate, !isPrivateUnlocked(item) { return }
+        completeNoteSave(saved, item: item, savedDraft: draft)
     }
 
+    /// - Returns: `true` when the content really reached the pasteboard. The
+    ///   panel's copy-and-dismiss path needs that: a locked card whose Touch ID
+    ///   prompt was cancelled must not take the whole panel down with it.
     @discardableResult
     func copyAsync(_ item: Clip) async -> Bool {
+        guard copyingID == nil else { return false }
+        copyingID = item.id
+        defer { copyingID = nil }
         guard let current = store.clip(id: item.id) else {
             NSSound.beep()
             showToast("复制失败：条目不存在或已被删除")
@@ -1166,7 +1495,9 @@ final class PanelViewModel: ObservableObject {
         if current.isPrivate, !isPrivateUnlocked(current) {
             let ok = await requestPrivateUnlockAsync(for: current)
             guard ok else {
-
+                // Used to return in complete silence: the panel closed, or
+                // nothing happened at all, and the user was left guessing
+                // whether their Touch ID prompt had been rejected.
                 NSSound.beep()
                 showToast("未复制：需要系统验证")
                 return false
@@ -1207,7 +1538,8 @@ final class PanelViewModel: ObservableObject {
     }
 
     private func beginMutation(for id: UUID) -> Bool {
-
+        // A second action on a card whose first action is still in flight used
+        // to be swallowed without a trace. A beep at least says "not now".
         guard pendingMutatingIDs.insert(id).inserted else {
             NSSound.beep()
             return false
@@ -1219,6 +1551,7 @@ final class PanelViewModel: ObservableObject {
         pendingMutatingIDs.remove(id)
     }
 
+    /// Opens the note editor after satisfying the private lock, if any.
     func openNoteEditor(_ item: Clip? = nil) {
         guard let target = item ?? selectedItem else {
             NSSound.beep()
@@ -1237,8 +1570,17 @@ final class PanelViewModel: ObservableObject {
             }
             return
         }
+        guard !noteIsSaving else { return }
+        let key = draftKey(item.id)
+        guard noteDrafts[key] != nil || noteDrafts.count < 8 else {
+            showToast("请先保存或放弃已有的备注草稿，再开始新的编辑")
+            return
+        }
         select(item)
-        noteDraft = item.note
+        noteEditingID = item.id
+        noteDraft = item.isPrivate ? item.note : (noteDrafts[key] ?? item.note)
+        noteError = nil
+        noteDiscardConfirmation = false
         showNoteEditor = true
     }
 
@@ -1254,6 +1596,8 @@ final class PanelViewModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
     }
 
+    /// Returns true when a history mutation must be rejected because a clear
+    /// transaction is currently running.
     private func rejectIfHistoryClearing() -> Bool {
         guard store.isClearingHistory else { return false }
         showToast("正在清空历史，请稍候")
@@ -1263,7 +1607,9 @@ final class PanelViewModel: ObservableObject {
 }
 
 extension Color {
-
+    /// P3 优化（2026-10-03）：按 hex 字符串缓存解析结果。调用点在卡片渲染
+    /// 热路径上（每卡每帧 2 次），Scanner 解析不必每次都来。视图层调用，
+    /// 字典只在主线程触达。
     private static var hexCache: [String: Color] = [:]
 
     init(hex: String) {

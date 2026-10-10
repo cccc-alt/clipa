@@ -3,6 +3,11 @@ import Foundation
 import ImageIO
 import UniformTypeIdentifiers
 
+/// Writes clipboard content. The snapshot helper is used by self-tests so they
+/// can restore the user's clipboard after exercising the system pasteboard.
+///
+/// Image/file payloads first pass a unified asset availability check so a
+/// missing file never reports a successful copy.
 final class ClipboardWriter {
     static let shared = ClipboardWriter()
 
@@ -12,6 +17,9 @@ final class ClipboardWriter {
         let pngFallback: Data?
     }
 
+    /// Convenience for callers that already have a plain string (the
+    /// format-conversion menu). The panel's own copy path goes through
+    /// `PanelViewModel`, which applies the private-content gate first.
     @discardableResult
     static func copy(_ content: String) -> Bool {
         shared.copyText(content)
@@ -67,7 +75,8 @@ final class ClipboardWriter {
                 return false
             }
             written = true
-
+            // The original format is what modern targets receive. A PNG
+            // fallback keeps targets that only ask for PNG working.
             if let png = prepared.pngFallback {
                 _ = pb.setData(png, forType: .png)
             }
@@ -75,7 +84,9 @@ final class ClipboardWriter {
             guard !item.fileURLs.isEmpty else { return false }
             pb.clearContents()
             written = pb.writeObjects(item.fileURLs as [NSURL])
-
+            // Finder also publishes the path(s) as text. Without it a text
+            // target — a chat box, a note, a terminal — pastes nothing at all,
+            // because the pasteboard only carries a file URL.
             if written {
                 _ = pb.setString(
                     item.fileURLs.map(\.path).joined(separator: "\n"),
@@ -92,13 +103,19 @@ final class ClipboardWriter {
         return written
     }
 
+    /// UI-path clipboard copy. Pasteboard access still happens on the main
+    /// thread (NSPasteboard is not safe off-thread), but image bytes are read
+    /// and converted on a background task first so large images never stall
+    /// the UI.
     @MainActor
     func copyAsync(
         _ item: Clip,
         store: ClipStore = .shared,
         to pasteboard: NSPasteboard = .general
     ) async -> Bool {
-
+        // Async twins throughout: this runs inside a `Task`, and the blocking
+        // bridges would hold a cooperative thread while waiting for a task that
+        // needs one — the deadlock that froze the app on an image-heavy store.
         guard await store.assetAvailabilityAsync(for: item) == .available else {
             return false
         }
@@ -109,7 +126,8 @@ final class ClipboardWriter {
         var written = false
         switch item.kind {
         case .image:
-
+            // The blob read awaits the database actor; the PNG fallback
+            // conversion is pure CPU work and stays off the main actor.
             guard let data = await store.imageDataAsync(for: item) else {
                 return false
             }
@@ -118,7 +136,8 @@ final class ClipboardWriter {
             ) { () -> PreparedImageCopy in
                 Self.preparedImage(item: item, data: data)
             }.value
-
+            // The file read happened off-thread; recapture anything that was
+            // copied externally while we were reading before we overwrite it.
             if pb === NSPasteboard.general {
                 monitor.flushPendingCapture()
             }
@@ -134,7 +153,8 @@ final class ClipboardWriter {
             guard !item.fileURLs.isEmpty else { return false }
             pb.clearContents()
             written = pb.writeObjects(item.fileURLs as [NSURL])
-
+            // See `copy(_:store:to:)`: the file URL alone cannot be pasted
+            // into a text target.
             if written {
                 _ = pb.setString(
                     item.fileURLs.map(\.path).joined(separator: "\n"),
@@ -151,6 +171,9 @@ final class ClipboardWriter {
         return written
     }
 
+    /// Uses the UTI the bytes were stored under, so a HEIC/JPEG/GIF stays in
+    /// its original format instead of being rewritten as PNG. A PNG fallback
+    /// is added only when the original is something else and can be decoded.
     private static func preparedImage(
         item: Clip,
         data: Data
@@ -183,6 +206,7 @@ final class ClipboardWriter {
         )
     }
 
+    /// Writes plain text produced by a local transform (formats).
     @discardableResult
     func copyText(_ text: String, to pasteboard: NSPasteboard = .general) -> Bool {
         let pb = pasteboard

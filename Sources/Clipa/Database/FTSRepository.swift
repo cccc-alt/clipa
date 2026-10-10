@@ -1,8 +1,12 @@
 import Foundation
 import CSQLCipher
 
+/// All reads/writes for `clips_fts`. The virtual table has no UUID or
+/// `source_app` columns; `rowid` is the same integer as `clips.db_id`.
 enum FTSRepository {
-
+    /// Bump whenever the indexed columns, the tokenizer or the meaning of the
+    /// stored text changes. A mismatch forces a rebuild without anyone having
+    /// to remember to run one.
     static let schemaVersion = 1
 
     static let markerKey = "fts.index_marker"
@@ -11,10 +15,19 @@ enum FTSRepository {
     static let sessionOpenValue = "open"
     static let sessionCleanValue = "clean"
 
+    /// A full content pass is not run on every launch; this is how stale a
+    /// "clean" index may get before it is verified row by row again.
     static let strongCheckInterval: TimeInterval = 7 * 24 * 60 * 60
 
+    /// Sample size for the per-launch content spot check.
     static let sampleCheckRows = 200
 
+    /// `indexed == false` 是私密条目的路径（M3）：索引列**必须留空**。
+    ///
+    /// 索引里存的是正文的归一化副本 —— 也就是**第二份明文**。私密内容加密了
+    /// `clips.text` 却在这里留一份可读副本，等于没加密；而且索引里放密文也没用
+    /// （trigram 匹配不到），只会让 `verifyStrong` 与 `clips.norm_text` 永久不一致。
+    /// 行还留着（`rowid = db_id` 的对齐不变量不变），只是没有内容可匹配。
     static func insert(
         rowid: Int64,
         text: String,
@@ -30,7 +43,8 @@ enum FTSRepository {
                 2,
                 indexed ? QueryNormalizer.normalize(text) : ""
             )
-
+            // Same normalizer as `clips.norm_note`: `verifyStrong` compares the
+            // two copies row by row, so they must be produced by the same rule.
             connection.bindText(
                 statement,
                 3,
@@ -62,6 +76,11 @@ enum FTSRepository {
         }
     }
 
+    /// 整行索引内容的改写，供"私密 ↔ 普通"切换用（M3）。
+    ///
+    /// 切换时必须同时改这一行：变私密要**收回**索引里的正文副本，取消私密要
+    /// **放回**。少了这一步，搜索会在切换后悄悄少一条或多一条；而且两个副本对不上
+    /// 时 `verifyStrong` 会判定索引不可信，于是每次启动都重建一遍。
     static func setContent(
         rowid: Int64,
         text: String,
@@ -105,9 +124,12 @@ enum FTSRepository {
         try connection.exec("DELETE FROM clips_fts")
     }
 
+    /// Candidate recall only. Final semantics are decided by MemorySearchIndex.
     struct FTSCandidateRecall: Equatable {
         let ids: Set<Int64>
-
+        /// True when recall stopped at the cap. The caller should fall back
+        /// to the complete memory index instead of treating the prefix as
+        /// an exhaustive candidate set.
         let truncated: Bool
     }
 
@@ -121,8 +143,17 @@ enum FTSRepository {
         var truncated = false
         try connection.prepare(sql) { statement in
             connection.bindText(statement, 1, query)
-            while sqlite3_step(statement) == SQLITE_ROW {
-
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { break }
+                guard status == SQLITE_ROW else {
+                    throw DatabaseError.sql(connection.lastErrorMessage)
+                }
+                // One row *past* the cap is what proves the recall was cut
+                // short. Stopping at `>= maxCount` reported a query that
+                // matched exactly `maxCount` rows as truncated, which threw
+                // away a complete candidate set and forced the caller into the
+                // full in-memory scan for nothing.
                 guard ids.count < maxCount else {
                     truncated = true
                     return
@@ -133,6 +164,8 @@ enum FTSRepository {
         return FTSCandidateRecall(ids: ids, truncated: truncated)
     }
 
+    /// Rebuilds the index from `clips`. Callers that also want the index
+    /// marker updated atomically should use `rebuildAndMark` instead.
     static func rebuild(connection: DatabaseConnection) throws {
         try connection.beginImmediate()
         do {
@@ -144,6 +177,8 @@ enum FTSRepository {
         }
     }
 
+    /// Rebuilds and stamps the marker in **one** transaction. A crash can
+    /// therefore never leave a "fresh marker + stale index" combination.
     static func rebuildAndMark(connection: DatabaseConnection) throws {
         try connection.beginImmediate()
         do {
@@ -157,18 +192,27 @@ enum FTSRepository {
         }
     }
 
+    /// Assumes an open transaction.
+    ///
+    /// Streams row by row. The previous version read the entire corpus into a
+    /// Swift array before deleting anything, so one rebuild held every clip's
+    /// text in memory *on top of* the index it was writing — inside the write
+    /// transaction that blocks captures — which on a 100k-row library is
+    /// hundreds of megabytes at the worst possible moment.
     private static func rebuildRows(connection: DatabaseConnection) throws {
         let insertSQL = """
             INSERT INTO clips_fts (rowid, text, note)
             VALUES (?, ?, ?)
             """
-
+        // 私密行一起读出来并**单独处理**（M3）：它们的落盘正文是密文，归一化密文
+        // 既没有意义（trigram 匹配不到），又会让索引与 `clips.norm_text` 永久不一致。
+        // 重建本来就是"把不变量重新摆正"的地方，所以顺手把它们的 `norm_*` 也清空。
         let selectSQL = """
             SELECT db_id, is_private, text, note,
                    COALESCE(norm_text, ''), COALESCE(norm_note, '')
             FROM clips
             """
-
+        // 收集而不是在扫描 `clips` 的过程中改它：迭代中的表被自己写会跳过行。
         var privateRowsNeedingNormReset: [Int64] = []
         try connection.exec("DELETE FROM clips_fts")
         try connection.prepare(selectSQL) { select in
@@ -184,7 +228,8 @@ enum FTSRepository {
                         2,
                         isPrivate ? "" : QueryNormalizer.normalize(text)
                     )
-
+                    // A rebuild must reproduce the same normalization as the
+                    // write paths, or the two copies would disagree.
                     connection.bindText(
                         insert,
                         3,
@@ -221,11 +266,16 @@ enum FTSRepository {
         try connection.rowCount(in: "clips_fts")
     }
 
+    // MARK: - Index trust (marker, verification, decision)
+
+    /// What `store_meta` vouches for. Written in the same transaction as the
+    /// rebuild it describes.
     struct IndexMarker: Codable, Equatable {
         let schemaVersion: Int
-
+        /// Normalized `sqlite_master.sql` of `clips_fts`.
         let ddlFingerprint: String
-
+        /// Outputs of `QueryNormalizer` for fixed probe inputs. Comparing them
+        /// catches a normalization change even if nobody bumped a version.
         let normalizerProbe: [String]
         let rowCount: Int
         let dbIDSum: Int64
@@ -235,6 +285,7 @@ enum FTSRepository {
         let buildCount: Int
     }
 
+    /// Cheap aggregates that must agree between `clips` and `clips_fts`.
     struct IndexAggregates: Equatable {
         let rowCount: Int
         let idSum: Int64
@@ -266,6 +317,9 @@ enum FTSRepository {
         case rebuild(RebuildReason, String)
     }
 
+    /// Inputs whose normalization output pins the normalizer's behaviour.
+    /// Deliberately covers the cases the search path cares about: uppercase,
+    /// decomposed accents, width folding, CRLF and CJK with spaces.
     static let normalizerProbeInputs = [
         "İstanbul",
         "ＡＢＣ",
@@ -278,6 +332,8 @@ enum FTSRepository {
         normalizerProbeInputs.map { QueryNormalizer.normalize($0) }
     }
 
+    /// `sqlite_master.sql` reduced to a stable form: case and whitespace are
+    /// not part of the contract, column order and options are.
     static func ddlFingerprint(connection: DatabaseConnection) -> String? {
         guard let sql = connection.ftsColumnList(for: "clips_fts") else {
             return nil
@@ -324,6 +380,8 @@ enum FTSRepository {
         )
     }
 
+    /// Byte lengths are read from SQLite metadata, so this is a cheap table
+    /// scan rather than a text pass.
     static func clipsAggregates(
         connection: DatabaseConnection
     ) throws -> IndexAggregates {
@@ -369,6 +427,9 @@ enum FTSRepository {
         }
     }
 
+    /// Row-by-row comparison of both sides, in rowid order, stopping at the
+    /// first difference. This is the "strong" check: it reads the whole corpus
+    /// but never rebuilds unless something is actually wrong.
     static func verifyStrong(
         connection: DatabaseConnection
     ) throws -> (ok: Bool, detail: String) {
@@ -418,6 +479,8 @@ enum FTSRepository {
         }
     }
 
+    /// Spot check used on every launch: a few random rows compared by content,
+    /// which catches drift the byte-length sums cannot see.
     static func verifySample(
         connection: DatabaseConnection,
         count: Int = sampleCheckRows
@@ -466,7 +529,11 @@ enum FTSRepository {
         dbID: Int64,
         connection: DatabaseConnection
     ) throws -> RowComparison {
-
+        // Both sides are read separately on purpose. The old version used an
+        // inner join, so a row that exists on one side only came back as "no
+        // row" and the sampler skipped it — the one inconsistency the spot
+        // check could never see, even though a missing candidate is exactly
+        // what makes a search silently lose a result.
         let clip: (text: String, note: String)? = try connection.prepare("""
             SELECT norm_text, norm_note FROM clips WHERE db_id = ?
             """) { statement in
@@ -505,6 +572,12 @@ enum FTSRepository {
         }
     }
 
+    /// Decides whether the index can be trusted as-is.
+    ///
+    /// The order is cheapest first: schema, marker, normalizer probe, then the
+    /// aggregate comparison, then a spot check, and finally a full row-by-row
+    /// pass when the last one is stale or the previous session did not end
+    /// cleanly.
     static func decide(
         connection: DatabaseConnection,
         now: Date = Date()
@@ -571,6 +644,8 @@ enum FTSRepository {
         return .trusted(storedMarker)
     }
 
+    /// A full pass runs when the last one is stale, or when the previous
+    /// session did not shut down cleanly (`session.state` left at "open").
     static func shouldRunStrongCheck(
         connection: DatabaseConnection,
         now: Date

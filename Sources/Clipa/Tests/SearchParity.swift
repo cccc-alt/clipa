@@ -1,7 +1,15 @@
 import Foundation
 
+/// Differential harness for the accuracy-first search work.
+///
+/// The in-memory engine is frozen as the reference; the SQL fast path must
+/// return exactly the same clips in exactly the same order. Every mismatch is
+/// reported with the query, the plan shape and both id lists, so a failure
+/// names the rule that diverged instead of just "results differ".
 enum SearchParity {
-
+    /// How many plan shapes each query is compared with. The ordinary search
+    /// box only ever produces the whole-keyword shape, so large probe sets use
+    /// that to keep the run bounded.
     enum PlanShapes {
         case all
         case wholeKeywordOnly
@@ -12,10 +20,13 @@ enum SearchParity {
         var fastTotalMS = 0.0
         var oracleCalls = 0
         var fastCalls = 0
-
+        /// Calls where the SQL fast path actually produced the candidate set,
+        /// i.e. where the comparison measured the optimization rather than the
+        /// shared FTS path.
         var engagedTotalMS = 0.0
         var engagedCalls = 0
-
+        /// Oracle cost of the very same calls, so the comparison is like for
+        /// like instead of averaging over different query mixes.
         var engagedOracleTotalMS = 0.0
 
         var oracleAverageMS: Double {
@@ -45,6 +56,11 @@ enum SearchParity {
         var isMatch: Bool { oracle == fast }
     }
 
+    // MARK: - Plans
+
+    /// Plan shapes that exercise every clause the SQL predicate can build:
+    /// single term, AND of single terms, one OR group, exclusion, and a
+    /// mixture.
     static func plans(for query: String) -> [(shape: String, plan: SearchQueryPlan)] {
         let normalized = QueryNormalizer.normalizeQuery(query)
         let tokens = normalized
@@ -74,6 +90,8 @@ enum SearchParity {
             )
         }
 
+        // Explicit sorts take the ids-only fast path; relevance takes the
+        // facts path. Both must agree with the oracle.
         var result = [
             make("whole-keyword", groups: [[normalized]]),
             make("whole-keyword+newest", groups: [[normalized]], sort: .newest),
@@ -95,6 +113,8 @@ enum SearchParity {
         }
         return result
     }
+
+    // MARK: - Comparison
 
     static func compare(
         store: ClipStore,
@@ -164,6 +184,12 @@ enum SearchParity {
         return comparisons
     }
 
+    /// P2a invariant: the evidence-based ranking must reproduce the reference
+    /// ranker's order exactly, even though it never re-reads a clip body.
+    ///
+    /// The engine's own result set is ranked twice — once through the evidence
+    /// path it uses in production, once through `SearchRanker.rank(candidates:)`
+    /// which scores by reading text — and the two orders must be identical.
     static func scoringMismatches(
         store: ClipStore,
         queries: [String],
@@ -218,6 +244,11 @@ enum SearchParity {
         return mismatches
     }
 
+    // MARK: - Adversarial corpus
+
+    /// Text chosen to attack exactly the places where byte substring matching
+    /// and grapheme-cluster matching can disagree, plus ordinary content so a
+    /// regression in the common case cannot hide behind the exotic rows.
     static func adversarialCorpus() -> [NewClip] {
         let texts: [String] = [
             "docker network bridge on host-a",
@@ -245,7 +276,8 @@ enum SearchParity {
                 contentHash: ContentHasher.hash(text: text + "#\(index)")
             )
         }
-
+        // An image row (empty body, searchable note) and a file row keep the
+        // metadata filters honest.
         clips.append(
             NewClip(
                 kind: .image,
@@ -265,6 +297,8 @@ enum SearchParity {
         return clips
     }
 
+    /// Queries derived from the corpus plus deliberate misses and the
+    /// ambiguous-cluster probes.
     static func adversarialQueries() -> [String] {
         [
             "docker network",
@@ -297,6 +331,8 @@ enum SearchParity {
         ]
     }
 
+    /// Probes built from the store's own rows, so a real library is exercised
+    /// with strings that are guaranteed to match something.
     static func probes(from store: ClipStore, limit: Int = 120) -> [String] {
         var probes: [String] = []
         for clip in store.items.prefix(limit) {
@@ -306,7 +342,8 @@ enum SearchParity {
             let width = min(8, characters.count / 2)
             let middle = (characters.count - width) / 2
             probes.append(String(characters[middle..<(middle + width)]))
-
+            // Short probes take the branch where FTS cannot help at all, which
+            // is exactly where the SQL fast path replaces the full Swift scan.
             probes.append(String(characters[0..<2]))
             if characters.count >= 12 {
                 probes.append(String(characters[0..<width]))
@@ -320,6 +357,10 @@ enum SearchParity {
         return Array(Set(probes)).sorted()
     }
 
+    // MARK: - CLI entry point
+
+    /// Manual index maintenance: print the current marker/verification state
+    /// and, on request, rebuild the index from `clips`.
     static func runFTSMaintenance(directory: URL?, rebuild: Bool) -> Int32 {
         print("========== Clipa FTS Index ==========")
         let base = directory ?? ClipStore.defaultBaseDirectory()
@@ -374,6 +415,10 @@ enum SearchParity {
         return 0
     }
 
+    /// Costs that sit *outside* what `--search-examples` measures: opening the
+    /// store (which rebuilds the whole FTS index on every launch), the isolated
+    /// FTS rebuild, and the per-search learning lookup that runs before the
+    /// engine does anything.
     static func runOverhead(directory: URL?, rounds: Int = 3) -> Int32 {
         print("========== Clipa Search Overhead ==========")
         guard let directory else {
@@ -422,6 +467,9 @@ enum SearchParity {
         return 0
     }
 
+    /// Per-query report: the same query run through the reference engine and
+    /// the optimized one, with the tier each one used and the measured cost.
+    /// This is the human-readable counterpart of `compare`.
     static func runExamples(
         directory: URL?,
         derivedClips: Int = 4,
@@ -473,7 +521,9 @@ enum SearchParity {
             ids: [Int64],
             candidateMS: Double,
             rankingMS: Double,
-
+            /// What `PanelViewModel.applySearchPipelineResult` does on the
+            /// main actor: section the rows and flatten them into the
+            /// navigation order.
             mainActorMS: Double
         ) {
             var best = Double.infinity
@@ -566,7 +616,8 @@ enum SearchParity {
         ) {
             guard let plan = plans(for: query).first?.plan else { continue }
             cases.append((query, query, plan))
-
+            // Same query ordered explicitly: this takes the ids-only path and
+            // never reaches the ranker.
             cases.append(
                 (
                     query + " ·newest",
@@ -594,7 +645,8 @@ enum SearchParity {
             if optimized.tier == .sqlExact, optimized.ms > 0 {
                 sqlSpeedups.append(reference.ms / optimized.ms)
             }
-
+            // How much text the ranker has to walk a second time: the memory
+            // validator already scanned it once while matching.
             let term = plan.keywordGroups.first?.first
             var hitBytes = 0
             var maxBytes = 0
@@ -687,6 +739,8 @@ enum SearchParity {
         return mismatches == 0 ? 0 : 1
     }
 
+    /// Queries used by the report: short prefixes (where FTS cannot help),
+    /// real substrings of the store's own clips, and a guaranteed miss.
     static func exampleQueries(
         from store: ClipStore,
         derivedClips: Int = 4,
@@ -708,6 +762,9 @@ enum SearchParity {
         return queries.filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
+    /// `probeLimit` bounds the row-derived half of the run: every probe
+    /// executes the oracle over the whole library, so the count is the main
+    /// thing that decides how long the check takes.
     static func run(directory: URL?, probeLimit: Int = 60) -> Int32 {
         print("========== Clipa Search Parity ==========")
         let isTemporary: Bool
@@ -758,6 +815,7 @@ enum SearchParity {
         let comparisons = adversarial + probeComparisons
         let mismatches = comparisons.filter { !$0.isMatch }
 
+        // P2a: the new scoring path must match the reference ranker exactly.
         let scoringMismatches = Self.scoringMismatches(
             store: store,
             queries: adversarialQueries()
@@ -816,6 +874,8 @@ enum SearchParity {
         return 1
     }
 
+    /// The parity harness is synchronous; it uses the same blocking bridge the
+    /// search path already uses for its actor hop.
     private enum DatabaseBridge {
         static func normalizationStatus(
             _ database: DatabaseManager

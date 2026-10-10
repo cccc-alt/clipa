@@ -5,20 +5,29 @@ struct RankedClip {
     let score: Int
 }
 
+/// A clip paired with its already-normalized fields from `MemorySearchIndex`.
 struct RankCandidate {
     let clip: Clip
     let fields: NormalizedSearchFields
 }
 
+// MARK: - Match evidence
+
+/// What a matcher learned about one (clip, term) pair while looking for the
+/// term. Both matchers produce it — the in-memory scan and SQLite's
+/// `instr()`/`length()` — so the ranker never has to walk the body again.
 struct TermMatchFacts: Equatable, Sendable {
-
+    /// 1-based character position of the first body occurrence; 0 = absent.
     var bodyPosition: Int = 0
-
+    /// Character length of the body, used for the exact-match test.
     var bodyLength: Int = 0
-
+    /// True when the first body occurrence starts a line.
     var bodyAtLineStart: Bool = false
     var noteMatched: Bool = false
 
+    /// Scans a normalized body/note once and records where the term was found.
+    /// `bodyLength` 由调用方传入缓存值（见 `NormalizedSearchFields`）时免掉
+    /// 每次 `body.count` 的全串走查。
     static func scan(
         body: String,
         note: String,
@@ -42,6 +51,8 @@ struct TermMatchFacts: Equatable, Sendable {
         return facts
     }
 
+    /// The single scoring rule, driven by facts instead of by re-reading text.
+    /// Mirrors the reference `SearchRanker.termScore(body:note:term:)`.
     static func score(facts: TermMatchFacts, termLength: Int) -> Int {
         if facts.bodyPosition > 0 {
             if facts.bodyPosition == 1 {
@@ -53,14 +64,17 @@ struct TermMatchFacts: Equatable, Sendable {
     }
 }
 
+/// Per-clip scoring input for one search, produced by whichever matcher ran.
 struct ClipMatchEvidence: Equatable, Sendable {
-
+    /// Best term score per positive group, in plan order.
     let groupBest: [Int]
-
+    /// How many terms of each group matched (drives the OR coverage bonus).
     let matchedTermCounts: [Int]
-
+    /// The ordered single-term phrase appears in the body (phrase bonus).
     let phraseMatched: Bool
 
+    /// Group aggregation, in the same order and with the same constants as the
+    /// reference ranker.
     var baseScore: Int {
         var base = 0
         for index in groupBest.indices {
@@ -77,14 +91,21 @@ struct ClipMatchEvidence: Equatable, Sendable {
     }
 }
 
+/// One SQL fast-path row: the clip id plus the facts each positive term
+/// produced. Kept as a typealias because Swift's parser rejects a tuple type
+/// containing an array type inside array sugar.
 typealias TermMatchRow = (
     dbID: Int64,
     facts: [TermMatchFacts],
     phraseMatched: Bool
 )
 
+/// Turns per-term facts into per-clip evidence.
 enum MatchEvidenceBuilder {
-
+    /// `facts` are flattened in plan order (group by group, term by term) and
+    /// `termLengths` is parallel to them. Returns `nil` when any positive group
+    /// has no hit — the caller must then treat the clip as not matching, or, on
+    /// the SQL path, fall back rather than silently drop it.
     static func evidence(
         facts: [TermMatchFacts],
         groups: [[String]],
@@ -126,14 +147,16 @@ enum MatchEvidenceBuilder {
 }
 
 enum MatchQuality {
-    case exact
-    case prefix
-    case linePrefix
+    case exact       // 整个 body == query
+    case prefix      // body 以 query 开头
+    case linePrefix  // 某一行以 query 开头
     case bodySubstring
     case noteSubstring
     case multiSubstring
 }
 
+/// Lightweight deterministic ranking: match quality dominates and a small
+/// recency bonus breaks ties.
 enum SearchRanker {
     static func rank(
         clips: [Clip],
@@ -154,6 +177,10 @@ enum SearchRanker {
             .map(\.0)
     }
 
+    /// Relevance ranking driven by the same planned terms used for recall.
+    /// Each AND group contributes its best matching term; OR groups may add a
+    /// small coverage bonus; an exact multi-term phrase keeps a bonus so a
+    /// contiguous "docker network" body still beats scattered matches.
     static func rank(
         clips: [Clip],
         query: SearchQuery,
@@ -172,6 +199,8 @@ enum SearchRanker {
         return rank(candidates: candidates, groups: groups, now: now)
     }
 
+    /// Production ranking path: fields come from the memory index, so no
+    /// clip body/note is normalized again during search.
     static func rank(
         candidates: [RankCandidate],
         groups: [[String]],
@@ -191,6 +220,12 @@ enum SearchRanker {
         )
     }
 
+    /// Production ranking path for the evidence-based matcher: the matcher
+    /// already recorded where each term matched, so no clip body is read here.
+    ///
+    /// `clips` and `evidence` are parallel arrays. Sorting happens on a compact
+    /// key (score, timestamp, index) so the sort never retains or releases a
+    /// `Clip`; the clips are touched again only once, to build the result.
     static func rank(
         clips: [Clip],
         evidence: [ClipMatchEvidence],
@@ -198,7 +233,12 @@ enum SearchRanker {
     ) -> [Clip] {
         guard !clips.isEmpty else { return [] }
         guard evidence.count == clips.count else {
-
+            // Defensive: the caller builds both in one pass, so this cannot
+            // happen today. Never drop clips because of it, but do not hand
+            // back the input order either — that is the dictionary traversal
+            // order, and it would make the result list non-deterministic.
+            // Fall back to the same total order the ranker uses when every
+            // score ties.
             return clips.sorted { lhs, rhs in
                 if lhs.lastCopiedAt != rhs.lastCopiedAt {
                     return lhs.lastCopiedAt > rhs.lastCopiedAt
@@ -217,7 +257,9 @@ enum SearchRanker {
         keys.reserveCapacity(clips.count)
         for index in clips.indices {
             let item = evidence[index]
-
+            // A metadata-only query (no positive groups) scores zero for
+            // everyone, exactly like the reference ranker, so the recency
+            // bonus must not be added there.
             let score = item.groupBest.isEmpty
                 ? 0
                 : item.baseScore
@@ -249,6 +291,8 @@ enum SearchRanker {
         return ranked
     }
 
+    /// Shared tie-breaking order: score, then recency, then `db_id`. A total
+    /// order, so results are deterministic and pageable.
     private static func sortRanked(_ ranked: [(Clip, Int)]) -> [Clip] {
         ranked
             .sorted { lhs, rhs in
@@ -261,6 +305,8 @@ enum SearchRanker {
             .map(\.0)
     }
 
+    /// The ordered multi-term phrase used for the phrase bonus: only a plan
+    /// whose groups are all single terms can form one.
     static func orderedPhrase(groups: [[String]]) -> String? {
         guard !groups.isEmpty,
               groups.allSatisfy({ $0.count == 1 }) else { return nil }
@@ -270,6 +316,7 @@ enum SearchRanker {
             .joined(separator: " ")
     }
 
+    /// Recency bonus buckets, shared by every ranking path.
     static func recencyBonus(now: Date, lastCopiedAt: Date) -> Int {
         let age = max(0, now.timeIntervalSince(lastCopiedAt))
         let days = age / 86_400
@@ -347,10 +394,13 @@ enum SearchRanker {
                 continue
             }
             base += best
-
+            // OR groups: every extra term that also matches is weak evidence,
+            // but never enough to outweigh one group's best body match.
             base += min(matchedTerms - 1, 2) * 20
         }
 
+        // Exact ordered multi-term phrase bonus for AND-style plans such as
+        // "docker network". Only single-term AND groups can form this phrase.
         if let phrase = orderedPhrase(groups: groups), body.contains(phrase) {
             base += 400
         }
@@ -368,7 +418,10 @@ enum SearchRanker {
         if !body.isEmpty {
             if body == term { return 1000 }
             if body.hasPrefix(term) { return 800 }
-
+            // One positioned search instead of "does a line start with it?"
+            // followed by "does it appear at all?": both questions read the
+            // whole body, and ranking runs over every candidate on each
+            // keystroke. Where the match sits decides the score.
             if let found = body.range(of: term) {
                 let atLineStart =
                     found.lowerBound == body.startIndex

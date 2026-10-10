@@ -1,13 +1,30 @@
 import Foundation
 
-/// MCP stdio bridge: translates tools/call into the local CLI pipeline.
+/// MCP stdio 薄壳：把 Model Context Protocol 的 `tools/call` 翻译成对 CLI 管道的调用。
+///
+/// **它不碰数据库、不认识令牌、不判任何策略** —— 令牌解析、作用域、私密硬排除、
+/// 审计、限流全部发生在应用进程里（CLI 的 `invoke` → socket → `APIControlService`）。
+/// 这里只是把 JSON-RPC 的参数拼成 `clipa` 的参数。M1「只读导出」的教训：
+/// 凡是第二条绕过授权与审计的通道，最后都得删 —— 所以薄壳刻意薄到没有资格藏东西。
+///
+/// 传输：MCP stdio 是**按行分隔的 JSON-RPC**。读一行、回一行、`fflush`（stdout
+/// 接管道时是块缓冲，不冲刷客户端就永远等不到回包）。
+///
+/// 接入（Claude Code / Cursor 等）：
+///
+///     { "mcpServers": { "clipa": { "command": "/Applications/Clipa.app/Contents/Helpers/clipa-mcp" } } }
+///
+/// 令牌与 CLI 同源：`CLIPA_TOKEN` 或 `~/.config/clipa/token`。
 enum APIMcp {
-
+    /// 客户端没带版本时用的兜底。带了就用双方都认识的最新版。
     private static let defaultProtocolVersion = "2024-11-05"
     private static let knownProtocolVersions = [
         "2024-11-05", "2025-03-26", "2025-06-18",
     ]
 
+    /// 读一行 stdin，**上限 64KB**（P2 修复 2026-10-03）。MCP 请求是 JSON 行，
+    /// 恶意/失控的宿主喂一条超长行时不再把内存吃光——超限部分丢弃，截断后的
+    /// 残行由 JSON 解码报错回给对方。EOF 且无内容返回 nil。
     private static func readCappedLine(maxBytes: Int = 64 * 1024) -> String? {
         var data = Data()
         var byte: UInt8 = 0
@@ -42,7 +59,7 @@ enum APIMcp {
                 write(error: -32600, message: "Invalid Request", id: id)
                 continue
             }
-
+            // 通知没有 id：按协议不回包。
             guard object["id"] != nil else { continue }
             switch method {
             case "initialize":
@@ -75,6 +92,8 @@ enum APIMcp {
             }
         }
     }
+
+    // MARK: - tools/call
 
     private static func handleCall(_ object: [String: Any], id: Any) {
         guard let params = object["params"] as? [String: Any],
@@ -109,6 +128,9 @@ enum APIMcp {
         ], id: id)
     }
 
+    /// 工具名 → CLI 参数。六个工具与六个动词一一对应；MCP 是给程序用的，
+    /// 一律 `--json`，并且 `--no-launch`（应用没在跑就该立刻失败让 Agent
+    /// 转告用户，而不是替用户悄悄拉起应用再等五秒）。
     private static func argv(
         for name: String,
         arguments: [String: Any]
@@ -117,7 +139,9 @@ enum APIMcp {
             (arguments[key] as? String).flatMap { $0.isEmpty ? nil : $0 }
         }
         func int(_ key: String) -> Int? {
-
+            // P2 修复（2026-10-03）：数字参数的类型容错——有的客户端把
+            // limit/offset 发成 "10"（字符串）或 10.0，旧实现静默丢弃，
+            // Agent 以为自己设了限制、实际用了默认值。
             switch arguments[key] {
             case let value as Int: return value
             case let value as Double: return Int(value)
@@ -162,6 +186,8 @@ enum APIMcp {
         }
         return base + ["--json", "--no-launch"]
     }
+
+    // MARK: - 工具清单
 
     private static let tools: [[String: Any]] = [
         [
@@ -258,6 +284,8 @@ enum APIMcp {
         ],
     ]
 
+    // MARK: - 输出
+
     private static func write(result: [String: Any], id: Any) {
         write([
             "jsonrpc": "2.0",
@@ -279,10 +307,14 @@ enum APIMcp {
             withJSONObject: object
         ), let line = String(data: data, encoding: .utf8) else { return }
         fputs(line + "\n", stdout)
-
+        // stdout 接管道时是块缓冲：不冲刷，客户端就永远等不到这一行。
         fflush(stdout)
     }
 
+    // MARK: - 客户端接入配置生成（新建令牌弹窗的一键复制）
+
+    /// Cursor：`~/.cursor/mcp.json` 的可合并片段（JSON）。内嵌令牌——
+    /// 粘贴进客户端配置后无需再配 CLIPA_TOKEN。
     static func cursorConfig(token: String, helperPath: String) -> String {
         let payload: [String: Any] = [
             "mcpServers": [
@@ -301,6 +333,7 @@ enum APIMcp {
         return text
     }
 
+    /// Codex：`~/.codex/config.toml` 的可合并片段（TOML）。
     static func codexConfig(token: String, helperPath: String) -> String {
         """
         [mcp_servers.clipa]

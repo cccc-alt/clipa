@@ -1,12 +1,35 @@
 import Foundation
 import CSQLCipher
 
+/// SQL-side text matching for the accuracy-gated fast path.
+///
+/// This repository never decides ordering, ranking or metadata semantics: it
+/// answers one question — which rows contain these phrases — by running the
+/// predicate over the normalized text copy (`clips.norm_text` /
+/// `clips.norm_note`) inside SQLite instead of scanning every clip's text in
+/// Swift. `MemorySearchIndex` stays the source of truth for everything else.
+///
+/// Every value is bound; the only string concatenation is the shape of the
+/// predicate itself, mirroring `FTSQueryBuilder`.
 enum SearchRepository {
     static let normalizationMarkerKey = "search.normalized_text_version"
 
+    /// Fingerprint of the normalizer's *behaviour*, taken from the same probe
+    /// the FTS index uses.
+    ///
+    /// A hand-written version number could be bumped without recomputing the
+    /// existing rows: the marker would then claim the columns were normalized
+    /// by the new rule while they still held the old one, and the SQL fast path
+    /// — which is trusted as equivalent — would compare new-normalized terms
+    /// against old-normalized text, silently losing or inventing matches.
+    /// Deriving the marker from the probe makes a rule change impossible to
+    /// miss, and keeps this side in step with the FTS rebuild that the same
+    /// probe already triggers.
     static func normalizationFingerprint() -> String {
         FTSRepository.normalizerProbe().joined(separator: "\u{1F}")
     }
+
+    // MARK: - Normalized text columns
 
     static func pendingNormalizationCount(
         connection: DatabaseConnection
@@ -16,6 +39,9 @@ enum SearchRepository {
         )
     }
 
+    /// O(1) marker check plus a full-column count, so a store that lost rows
+    /// (or gained rows from an older build) can never enable the fast path and
+    /// silently drop matches.
     static func isNormalizationComplete(
         connection: DatabaseConnection
     ) -> Bool {
@@ -29,6 +55,8 @@ enum SearchRepository {
         return pending == 0
     }
 
+    /// Fills `norm_text` / `norm_note` for one batch. Returns how many rows
+    /// were written; `0` means the backfill is complete.
     @discardableResult
     static func backfillNormalizedText(
         connection: DatabaseConnection,
@@ -39,7 +67,10 @@ enum SearchRepository {
             let text: String
             let note: String
         }
-
+        // `is_private = 0`：私密行的正文是密文（M3），归一化它既没意义，也会把
+        // 一份可索引的副本留在库里。正常情况下私密行走不到这里（它们写的是空串
+        // 而不是 NULL）；这条条件是防线——将来某个路径把私密行的 norm_text 清回
+        // NULL 时，明文不会被悄悄回填。
         let rows: [PendingRow] = try connection.prepare("""
             SELECT db_id, text, note FROM clips
             WHERE norm_text IS NULL
@@ -94,6 +125,16 @@ enum SearchRepository {
         return rows.count
     }
 
+    /// Clears the normalized columns in `db_id` batches so the backfill
+    /// recomputes them under the current rule.
+    ///
+    /// Batched on purpose: this runs once after a rule change, and on a large
+    /// library a single transaction would hold the whole table's worth of
+    /// writes in the WAL. A crash mid-way simply repeats from the start.
+    ///
+    /// **私密行被排除**（M3）：它们落盘是密文，`norm_text`/`norm_note` 是空的
+    /// 占位而不是 `NULL`。这里若把它们清成 `NULL`，紧接着的回填就会把**明文**
+    /// 写回索引列——加密刚做完就被自己拆掉，而且换一条归一化规则就会再发生一次。
     @discardableResult
     static func clearNormalizedText(
         connection: DatabaseConnection,
@@ -136,6 +177,9 @@ enum SearchRepository {
         return batches
     }
 
+    /// Brings the normalized columns up to the current rule, then records the
+    /// fingerprint. Idempotent: a crash mid-way simply re-runs what is still
+    /// NULL next launch.
     static func completeNormalizationIfNeeded(
         connection: DatabaseConnection
     ) throws {
@@ -145,7 +189,9 @@ enum SearchRepository {
             connection: connection
         )
         if stored != fingerprint {
-
+            // Either the rule changed or the columns were never stamped. The
+            // marker is deliberately not written before the text is recomputed
+            // — stamping it would make the fast path trust stale columns.
             try clearNormalizedText(connection: connection)
         }
         while try pendingNormalizationCount(connection: connection) > 0 {
@@ -162,6 +208,8 @@ enum SearchRepository {
         )
     }
 
+    /// `clips` row count and how many of them carry normalized text. Used by
+    /// the integrity gate and by the self-test.
     static func integritySnapshot(
         connection: DatabaseConnection
     ) throws -> (clips: Int, normalized: Int) {
@@ -173,6 +221,14 @@ enum SearchRepository {
         return (clips, normalized)
     }
 
+    // MARK: - Fast-path text matching
+
+    /// Ids only, for plans whose order does not need scoring
+    /// (`newest` / `oldest` never reach the ranker).
+    ///
+    /// Skipping the fact projection is worth roughly 40% of the statement for
+    /// broad short queries: `instr` for the filter stays, but the position,
+    /// body length, line-start and note columns are not computed at all.
     static func exactCandidateIDs(
         criteria: SearchCriteria,
         connection: DatabaseConnection
@@ -206,13 +262,30 @@ enum SearchRepository {
                 connection.bindText(statement, Int32(offset + 1), value)
             }
             var ids: [Int64] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { break }
+                guard status == SQLITE_ROW else {
+                    throw DatabaseError.sql(connection.lastErrorMessage)
+                }
                 ids.append(sqlite3_column_int64(statement, 0))
             }
             return ids
         }
     }
 
+    /// Exact text matches together with the facts the ranker needs.
+    ///
+    /// The predicate mirrors `MemorySearchIndex.matchingIDs` term for term:
+    /// every group must contain one of its terms, no excluded term may be
+    /// present. Metadata is deliberately *not* applied here — the oracle keeps
+    /// filtering it, so a mistake in this predicate cannot hide a row.
+    ///
+    /// `instr()` is already evaluated while filtering, so the same expressions
+    /// are also projected: where the term matched, how long the body is,
+    /// whether the first hit starts a line, and whether the note matched. The
+    /// scoring rules themselves stay in Swift — SQL only reports facts, which
+    /// is what keeps ranking to a single implementation.
     static func exactMatches(
         criteria: SearchCriteria,
         terms: [String],
@@ -220,7 +293,8 @@ enum SearchRepository {
         connection: DatabaseConnection
     ) throws -> [TermMatchRow] {
         guard !criteria.groups.isEmpty else { return [] }
-
+        // An empty OR group can never be satisfied, exactly like the oracle's
+        // `group.contains { ... }` returning false.
         guard !criteria.groups.contains(where: \.isEmpty) else { return [] }
 
         var termParams: [Int] = []
@@ -303,7 +377,12 @@ enum SearchRepository {
             }
 
             var rows: [TermMatchRow] = []
-            while sqlite3_step(statement) == SQLITE_ROW {
+            while true {
+                let status = sqlite3_step(statement)
+                if status == SQLITE_DONE { break }
+                guard status == SQLITE_ROW else {
+                    throw DatabaseError.sql(connection.lastErrorMessage)
+                }
                 let dbID = sqlite3_column_int64(statement, 0)
                 var facts: [TermMatchFacts] = []
                 facts.reserveCapacity(terms.count)
